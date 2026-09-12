@@ -880,6 +880,417 @@ function extrairOrderId(lineItem) {
 }
 
 // ============================================================
+// TESTE DE AUTENTICAÇÃO GOOGLE PLAY
+// ============================================================
+//
+// GET /google/test-auth
+//
+// Testa se a Service Account consegue autenticar no Google.
+// Não expõe access token nem chave privada.
+// ============================================================
+
+app.get(
+  '/google/test-auth',
+
+  async (req, res) => {
+    try {
+      await obterAccessTokenGoogle();
+
+      console.log(
+        '>>> TESTE GOOGLE: autenticação com Service Account OK'
+      );
+
+      return res.json({
+        success:
+          true,
+
+        google_auth:
+          true,
+
+        message:
+          'Autenticação com a conta de serviço Google realizada com sucesso.',
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO NO TESTE DE AUTENTICAÇÃO GOOGLE:',
+        error.response?.data ||
+        error.message
+      );
+
+      const statusHttp =
+        error.response?.status ||
+        500;
+
+      let mensagem =
+        error.response?.data?.error?.message ||
+        error.response?.data?.message ||
+        error.message ||
+        'Erro ao autenticar no Google.';
+
+      if (
+        typeof mensagem !==
+        'string'
+      ) {
+        mensagem =
+          JSON.stringify(
+            mensagem
+          );
+      }
+
+      return res
+        .status(statusHttp)
+        .json({
+          success:
+            false,
+
+          google_auth:
+            false,
+
+          error:
+            mensagem,
+        });
+    }
+  }
+);
+
+// ============================================================
+// DIAGNÓSTICO COMPLETO - GOOGLE + SUPABASE
+// ============================================================
+
+app.get(
+  '/google/diagnostico',
+
+  protegerDiagnostico,
+
+  async (req, res) => {
+    const resultado = {
+      success:
+        false,
+
+      google:
+        {
+          auth:
+            false,
+        },
+
+      supabase:
+        {
+          ok:
+            false,
+        },
+
+      configuracao:
+        {
+          package_name:
+            Boolean(
+              process.env.GOOGLE_PACKAGE_NAME
+            ),
+
+          service_account:
+            Boolean(
+              process.env.GOOGLE_SERVICE_ACCOUNT_JSON
+            ),
+
+          supabase_url:
+            Boolean(
+              process.env.SUPABASE_URL
+            ),
+
+          supabase_secret:
+            Boolean(
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            ),
+        },
+    };
+
+    try {
+      await obterAccessTokenGoogle();
+
+      resultado.google.auth =
+        true;
+
+      const diagnosticoSupabase =
+        await diagnosticarSupabase();
+
+      resultado.supabase =
+        {
+          ok:
+            true,
+
+          ...diagnosticoSupabase,
+        };
+
+      resultado.success =
+        true;
+
+      return res.json(
+        resultado
+      );
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO NO DIAGNÓSTICO COMPLETO:',
+        error.response?.data ||
+        error.message
+      );
+
+      resultado.error =
+        error.response?.data?.error?.message ||
+        error.response?.data?.message ||
+        error.message ||
+        'Erro desconhecido no diagnóstico.';
+
+      return res
+        .status(
+          error.response?.status ||
+          500
+        )
+        .json(
+          resultado
+        );
+    }
+  }
+);
+
+// ============================================================
+// DIAGNÓSTICO - ESTRUTURA DE UM PLANO GOOGLE
+// ============================================================
+
+app.post(
+  '/google/diagnostico/plano',
+
+  protegerDiagnostico,
+
+  async (req, res) => {
+    try {
+      const planoId =
+        String(
+          req.body?.plano_id ||
+          ''
+        ).trim();
+
+      if (!planoId) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            error:
+              'plano_id é obrigatório.',
+          });
+      }
+
+      const plano =
+        await buscarPlanoGooglePorId(
+          planoId
+        );
+
+      if (!plano) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            error:
+              'Plano não encontrado.',
+          });
+      }
+
+      const googleProductId =
+        String(
+          plano.google_product_id ||
+          ''
+        ).trim();
+
+      const googleBasePlanId =
+        String(
+          plano.google_base_plan_id ||
+          ''
+        ).trim();
+
+      const configurado =
+        plano.google_ativo === true &&
+        googleProductId.length > 0 &&
+        googleBasePlanId.length > 0;
+
+      return res.json({
+        success:
+          true,
+
+        configurado_para_google:
+          configurado,
+
+        plano:
+          {
+            id:
+              plano.id,
+
+            nome_plano:
+              plano.nome_plano,
+
+            google_ativo:
+              plano.google_ativo,
+
+            google_product_id:
+              googleProductId || null,
+
+            google_base_plan_id:
+              googleBasePlanId || null,
+          },
+
+        message:
+          configurado
+            ? 'Plano pronto para integração Google.'
+            : 'Plano ainda possui configuração Google pendente.',
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO NO DIAGNÓSTICO DO PLANO:',
+        error.response?.data ||
+        error.message
+      );
+
+      return res
+        .status(
+          error.response?.status ||
+          500
+        )
+        .json({
+          success:
+            false,
+
+          error:
+            error.response?.data?.error?.message ||
+            error.response?.data?.message ||
+            error.message,
+        });
+    }
+  }
+);
+
+// ============================================================
+// DIAGNÓSTICO - TESTE CONTROLADO DE GRAVAÇÃO
+// ============================================================
+
+app.post(
+  '/google/diagnostico/testar-gravacao',
+
+  protegerDiagnostico,
+
+  async (req, res) => {
+    try {
+      const usuarioId =
+        String(
+          req.body?.usuario_id ||
+          ''
+        ).trim();
+
+      const planoId =
+        String(
+          req.body?.plano_id ||
+          ''
+        ).trim();
+
+      if (
+        !usuarioId ||
+        !planoId
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            error:
+              'usuario_id e plano_id são obrigatórios.',
+          });
+      }
+
+      const [
+        usuarioExiste,
+        plano,
+      ] =
+        await Promise.all([
+          verificarUsuarioExiste(
+            usuarioId
+          ),
+
+          buscarPlanoGooglePorId(
+            planoId
+          ),
+        ]);
+
+      if (!usuarioExiste) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            error:
+              'usuario_id não encontrado em tab_usuarios.',
+          });
+      }
+
+      if (!plano) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            error:
+              'plano_id não encontrado em tab_planos.',
+          });
+      }
+
+      const teste =
+        await testarGravacaoAssinaturaGoogle({
+          usuarioId,
+          planoId,
+        });
+
+      return res.json({
+        success:
+          true,
+
+        gravacao:
+          teste,
+
+        message:
+          'Teste de gravação concluído e registro temporário removido.',
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO NO TESTE DE GRAVAÇÃO:',
+        error.response?.data ||
+        error.message
+      );
+
+      return res
+        .status(
+          error.response?.status ||
+          500
+        )
+        .json({
+          success:
+            false,
+
+          error:
+            error.response?.data?.error?.message ||
+            error.response?.data?.message ||
+            error.message,
+        });
+    }
+  }
+);
+
+// ============================================================
 // ROTA DE SAÚDE
 // ============================================================
 
