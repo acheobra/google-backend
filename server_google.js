@@ -570,6 +570,87 @@ function extrairOrderId(lineItem) {
 }
 
 // ============================================================
+// TESTE DE AUTENTICAÇÃO GOOGLE PLAY
+// ============================================================
+//
+// GET /google/test-auth
+//
+// Testa apenas se a conta de serviço consegue autenticar
+// corretamente no Google e obter um access token válido.
+//
+// IMPORTANTE:
+// - Não expõe o access token.
+// - Não expõe a chave privada.
+// - Não expõe o conteúdo do GOOGLE_SERVICE_ACCOUNT_JSON.
+// - Não consulta uma compra real.
+// ============================================================
+
+app.get(
+  '/google/test-auth',
+
+  async (req, res) => {
+    try {
+      await obterAccessTokenGoogle();
+
+      console.log(
+        '>>> TESTE GOOGLE: autenticação com Service Account OK'
+      );
+
+      return res.json({
+        success:
+          true,
+
+        google_auth:
+          true,
+
+        message:
+          'Autenticação com a conta de serviço Google realizada com sucesso.',
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO NO TESTE DE AUTENTICAÇÃO GOOGLE:',
+        error.response?.data ||
+        error.message
+      );
+
+      const statusHttp =
+        error.response?.status ||
+        500;
+
+      let mensagem =
+        error.response?.data?.error?.message ||
+        error.response?.data?.message ||
+        error.message ||
+        'Erro ao autenticar no Google.';
+
+      if (
+        typeof mensagem !==
+        'string'
+      ) {
+        mensagem =
+          JSON.stringify(
+            mensagem
+          );
+      }
+
+      return res
+        .status(statusHttp)
+        .json({
+          success:
+            false,
+
+          google_auth:
+            false,
+
+          error:
+            mensagem,
+        });
+    }
+  }
+);
+
+// ============================================================
 // ROTA DE SAÚDE
 // ============================================================
 
