@@ -37,6 +37,63 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 10000;
 
+
+// ============================================================
+// DIAGNÓSTICO SEGURO
+// ============================================================
+//
+// Variável opcional esperada no Render:
+//
+// GOOGLE_DIAGNOSTIC_KEY
+//
+// As rotas /google/diagnostico/* exigem o header:
+//
+// x-diagnostic-key: <GOOGLE_DIAGNOSTIC_KEY>
+//
+// Isso evita deixar rotas técnicas abertas ao público.
+// ============================================================
+
+function obterDiagnosticKey() {
+  return String(
+    process.env.GOOGLE_DIAGNOSTIC_KEY || ''
+  ).trim();
+}
+
+function protegerDiagnostico(req, res, next) {
+  const chaveEsperada =
+    obterDiagnosticKey();
+
+  if (!chaveEsperada) {
+    return res
+      .status(503)
+      .json({
+        success: false,
+        error:
+          'GOOGLE_DIAGNOSTIC_KEY não configurada no Render.',
+      });
+  }
+
+  const chaveRecebida =
+    String(
+      req.headers['x-diagnostic-key'] || ''
+    ).trim();
+
+  if (
+    !chaveRecebida ||
+    chaveRecebida !== chaveEsperada
+  ) {
+    return res
+      .status(401)
+      .json({
+        success: false,
+        error:
+          'Chave de diagnóstico inválida.',
+      });
+  }
+
+  next();
+}
+
 // ============================================================
 // GOOGLE PLAY - CONFIGURAÇÃO
 // ============================================================
@@ -370,6 +427,259 @@ async function buscarAssinaturaGooglePorToken(
 }
 
 // ============================================================
+// HELPERS DE DIAGNÓSTICO DO SUPABASE
+// ============================================================
+
+async function diagnosticarSupabase() {
+  const {
+    supabaseUrl,
+  } = obterConfiguracaoSupabase();
+
+  const headers =
+    obterHeadersSupabase();
+
+  const [
+    planosResponse,
+    assinaturasResponse,
+  ] =
+    await Promise.all([
+      axios({
+        method: 'GET',
+
+        url:
+          `${supabaseUrl}/rest/v1/tab_planos`,
+
+        params: {
+          select:
+            'id,nome_plano,google_product_id,google_base_plan_id,google_ativo',
+
+          limit:
+            5,
+        },
+
+        headers,
+
+        timeout:
+          30000,
+      }),
+
+      axios({
+        method: 'GET',
+
+        url:
+          `${supabaseUrl}/rest/v1/tab_assinaturas_google`,
+
+        params: {
+          select:
+            'id',
+
+          limit:
+            1,
+        },
+
+        headers,
+
+        timeout:
+          30000,
+      }),
+    ]);
+
+  return {
+    tab_planos:
+      {
+        acessivel:
+          true,
+
+        quantidade_amostra:
+          Array.isArray(
+            planosResponse.data
+          )
+            ? planosResponse.data.length
+            : 0,
+
+        planos:
+          Array.isArray(
+            planosResponse.data
+          )
+            ? planosResponse.data
+            : [],
+      },
+
+    tab_assinaturas_google:
+      {
+        acessivel:
+          true,
+
+        consulta_realizada:
+          true,
+
+        quantidade_amostra:
+          Array.isArray(
+            assinaturasResponse.data
+          )
+            ? assinaturasResponse.data.length
+            : 0,
+      },
+  };
+}
+
+async function verificarUsuarioExiste(usuarioId) {
+  const {
+    supabaseUrl,
+  } = obterConfiguracaoSupabase();
+
+  const response =
+    await axios({
+      method: 'GET',
+
+      url:
+        `${supabaseUrl}/rest/v1/tab_usuarios`,
+
+      params: {
+        select:
+          'id',
+
+        id:
+          `eq.${usuarioId}`,
+
+        limit:
+          1,
+      },
+
+      headers:
+        obterHeadersSupabase(),
+
+      timeout:
+        30000,
+    });
+
+  return (
+    Array.isArray(response.data) &&
+    response.data.length > 0
+  );
+}
+
+async function testarGravacaoAssinaturaGoogle({
+  usuarioId,
+  planoId,
+}) {
+  const {
+    supabaseUrl,
+  } = obterConfiguracaoSupabase();
+
+  const purchaseToken =
+    `DIAGNOSTICO_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2)}`;
+
+  const agoraIso =
+    new Date()
+      .toISOString();
+
+  const payload = {
+    usuario_id:
+      usuarioId,
+
+    plano_id:
+      planoId,
+
+    google_product_id:
+      'diagnostico_google',
+
+    google_base_plan_id:
+      'diagnostico',
+
+    purchase_token:
+      purchaseToken,
+
+    google_order_id:
+      null,
+
+    status_assinatura:
+      'teste_diagnostico',
+
+    acknowledgement_state:
+      null,
+
+    auto_renovacao:
+      false,
+
+    data_inicio:
+      agoraIso,
+
+    data_expiracao:
+      agoraIso,
+
+    data_ultimo_pagamento:
+      null,
+
+    cancelado_em:
+      null,
+
+    updated_at:
+      agoraIso,
+  };
+
+  const insertResponse =
+    await axios({
+      method: 'POST',
+
+      url:
+        `${supabaseUrl}/rest/v1/tab_assinaturas_google`,
+
+      headers: {
+        ...obterHeadersSupabase(),
+
+        Prefer:
+          'return=representation',
+      },
+
+      data:
+        payload,
+
+      timeout:
+        30000,
+    });
+
+  const inserido =
+    Array.isArray(
+      insertResponse.data
+    )
+      ? insertResponse.data[0] || null
+      : null;
+
+  // Limpeza imediata para não deixar sujeira na tabela.
+  await axios({
+    method: 'DELETE',
+
+    url:
+      `${supabaseUrl}/rest/v1/tab_assinaturas_google`,
+
+    params: {
+      purchase_token:
+        `eq.${purchaseToken}`,
+    },
+
+    headers:
+      obterHeadersSupabase(),
+
+    timeout:
+      30000,
+  });
+
+  return {
+    inseriu:
+      Boolean(inserido),
+
+    removeu_apos_teste:
+      true,
+
+    purchase_token_teste:
+      purchaseToken,
+  };
+}
+
+// ============================================================
 // GOOGLE PLAY - CONSULTAR ASSINATURA V2
 // ============================================================
 //
@@ -568,87 +878,6 @@ function extrairOrderId(lineItem) {
       : null
   );
 }
-
-// ============================================================
-// TESTE DE AUTENTICAÇÃO GOOGLE PLAY
-// ============================================================
-//
-// GET /google/test-auth
-//
-// Testa apenas se a conta de serviço consegue autenticar
-// corretamente no Google e obter um access token válido.
-//
-// IMPORTANTE:
-// - Não expõe o access token.
-// - Não expõe a chave privada.
-// - Não expõe o conteúdo do GOOGLE_SERVICE_ACCOUNT_JSON.
-// - Não consulta uma compra real.
-// ============================================================
-
-app.get(
-  '/google/test-auth',
-
-  async (req, res) => {
-    try {
-      await obterAccessTokenGoogle();
-
-      console.log(
-        '>>> TESTE GOOGLE: autenticação com Service Account OK'
-      );
-
-      return res.json({
-        success:
-          true,
-
-        google_auth:
-          true,
-
-        message:
-          'Autenticação com a conta de serviço Google realizada com sucesso.',
-      });
-
-    } catch (error) {
-      console.error(
-        '>>> ERRO NO TESTE DE AUTENTICAÇÃO GOOGLE:',
-        error.response?.data ||
-        error.message
-      );
-
-      const statusHttp =
-        error.response?.status ||
-        500;
-
-      let mensagem =
-        error.response?.data?.error?.message ||
-        error.response?.data?.message ||
-        error.message ||
-        'Erro ao autenticar no Google.';
-
-      if (
-        typeof mensagem !==
-        'string'
-      ) {
-        mensagem =
-          JSON.stringify(
-            mensagem
-          );
-      }
-
-      return res
-        .status(statusHttp)
-        .json({
-          success:
-            false,
-
-          google_auth:
-            false,
-
-          error:
-            mensagem,
-        });
-    }
-  }
-);
 
 // ============================================================
 // ROTA DE SAÚDE
