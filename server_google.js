@@ -769,6 +769,8 @@ async function marcarAssinaturaAnteriorComoSubstituida({
 
   return atualizarAssinaturaGooglePorToken(token, {
     status_assinatura: motivo || 'substituido',
+    tipo_compra: 'recorrente',
+    recorrente: true,
     cancelado_em: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
@@ -945,6 +947,12 @@ async function testarGravacaoAssinaturaGoogle({
 
     google_base_plan_id:
       'diagnostico',
+
+    tipo_compra:
+      'recorrente',
+
+    recorrente:
+      true,
 
     purchase_token:
       purchaseToken,
@@ -2054,6 +2062,8 @@ app.post(
             plano_id: plano.id,
             google_product_id: googleProductIdEsperado,
             google_base_plan_id: googleBasePlanIdEsperado,
+            tipo_compra: 'recorrente',
+            recorrente: true,
             purchase_token: purchaseToken,
             google_order_id: orderId,
             status_assinatura: statusInterno,
@@ -2280,6 +2290,8 @@ app.post(
           plano_id: plano.id,
           google_product_id: googleProductIdEsperado,
           google_base_plan_id: null,
+          tipo_compra: 'avulso',
+          recorrente: false,
           purchase_token: purchaseToken,
           google_order_id: orderId,
           status_assinatura: statusInterno,
@@ -2383,6 +2395,8 @@ app.post(
             purchaseTokenAnterior,
             {
               status_assinatura: 'cancelado_com_acesso',
+              tipo_compra: 'recorrente',
+              recorrente: true,
               cancelado_em: agoraIso,
               auto_renovacao: false,
               updated_at: agoraIso,
