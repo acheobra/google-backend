@@ -8,6 +8,74 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ============================================================
+// LOG GLOBAL SEGURO DE REQUISIÇÕES
+// ============================================================
+//
+// Não registra Authorization, Service Role, chave privada ou purchaseToken
+// completo. Os logs abaixo foram pensados para facilitar o diagnóstico no
+// Render sem expor credenciais.
+//
+function mascararToken(valor) {
+  const texto = String(valor || '').trim();
+
+  if (!texto) return null;
+  if (texto.length <= 10) return '***';
+
+  return `${texto.slice(0, 4)}...${texto.slice(-6)}`;
+}
+
+function logGoogle(etapa, dados = {}) {
+  const seguro = { ...dados };
+
+  for (const chave of Object.keys(seguro)) {
+    const nome = chave.toLowerCase();
+
+    if (
+      nome.includes('token') ||
+      nome.includes('authorization') ||
+      nome.includes('service_role') ||
+      nome.includes('private_key')
+    ) {
+      seguro[chave] = mascararToken(seguro[chave]);
+    }
+  }
+
+  console.log(
+    `[GOOGLE][${new Date().toISOString()}][${etapa}]`,
+    JSON.stringify(seguro)
+  );
+}
+
+app.use((req, res, next) => {
+  const inicio = Date.now();
+  const requestId =
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  req.googleRequestId = requestId;
+
+  logGoogle('HTTP_IN', {
+    request_id: requestId,
+    method: req.method,
+    path: req.path,
+    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null,
+    user_agent: req.headers['user-agent'] || null,
+  });
+
+  res.on('finish', () => {
+    logGoogle('HTTP_OUT', {
+      request_id: requestId,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duracao_ms: Date.now() - inicio,
+    });
+  });
+
+  next();
+});
+
+
+// ============================================================
 // CORS
 // ============================================================
 
@@ -425,6 +493,295 @@ async function buscarAssinaturaGooglePorToken(
     ? response.data[0] || null
     : null;
 }
+
+
+// ============================================================
+// SUPABASE - TROCA DE PLANOS GOOGLE
+// ============================================================
+
+function obterNomeBasePlano(nomePlano) {
+  return String(nomePlano || '')
+    .replace(/\s*[-–—]\s*(recorrente|avulso)\s*$/i, '')
+    .trim();
+}
+
+async function atualizarPlanoAtivoUsuarioGoogle({
+  usuarioId,
+  plano,
+  recorrente,
+  dataAtivacao,
+}) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const payload = {
+    nome_plano_ativo: obterNomeBasePlano(plano?.nome_plano),
+    id_plano_atual: plano.id,
+    plano_id: plano.id,
+    recorrente: Boolean(recorrente),
+    plano_data_ativacao: dataAtivacao || new Date().toISOString(),
+  };
+
+  logGoogle('SUPABASE_USUARIO_ATUALIZAR_INICIO', {
+    usuario_id: usuarioId,
+    plano_id: plano.id,
+    recorrente: Boolean(recorrente),
+  });
+
+  const response = await axios({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_usuarios`,
+    params: {
+      id: `eq.${usuarioId}`,
+    },
+    headers: {
+      ...obterHeadersSupabase(),
+      Prefer: 'return=representation',
+    },
+    data: payload,
+    timeout: 30000,
+  });
+
+  const atualizado =
+    Array.isArray(response.data) ? response.data[0] || null : null;
+
+  if (!atualizado) {
+    throw new Error(
+      'Não foi possível sincronizar o plano ativo em tab_usuarios.'
+    );
+  }
+
+  logGoogle('SUPABASE_USUARIO_ATUALIZADO', {
+    usuario_id: usuarioId,
+    plano_id: plano.id,
+    recorrente: Boolean(recorrente),
+  });
+
+  return atualizado;
+}
+
+async function atualizarAssinaturaGooglePorToken(
+  purchaseToken,
+  dados
+) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await axios({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_assinaturas_google`,
+    params: {
+      purchase_token: `eq.${purchaseToken}`,
+    },
+    headers: {
+      ...obterHeadersSupabase(),
+      Prefer: 'return=representation',
+    },
+    data: dados,
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+async function buscarAssinaturasGoogleDoUsuario(usuarioId) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_assinaturas_google`,
+    params: {
+      select: '*',
+      usuario_id: `eq.${usuarioId}`,
+      order: 'updated_at.desc',
+      limit: 50,
+    },
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data) ? response.data : [];
+}
+
+async function buscarAssinaturaGoogleAnteriorSegura({
+  usuarioId,
+  purchaseTokenAnterior,
+}) {
+  const token = String(purchaseTokenAnterior || '').trim();
+
+  if (!token) return null;
+
+  const registro = await buscarAssinaturaGooglePorToken(token);
+
+  if (!registro) return null;
+
+  if (String(registro.usuario_id || '') !== String(usuarioId)) {
+    throw new Error(
+      'O purchase_token_anterior não pertence ao usuário autenticado.'
+    );
+  }
+
+  return registro;
+}
+
+// ============================================================
+// GOOGLE PLAY - PRODUTO AVULSO V2
+// ============================================================
+
+async function consultarProdutoAvulsoGoogle(purchaseToken) {
+  const packageName = obterGooglePackageName();
+  const accessToken = await obterAccessTokenGoogle();
+
+  logGoogle('GOOGLE_AVULSO_CONSULTA', {
+    package_name: packageName,
+    purchase_token: purchaseToken,
+  });
+
+  const response = await axios({
+    method: 'GET',
+    url:
+      `${GOOGLE_ANDROID_PUBLISHER_BASE_URL}` +
+      `/applications/${encodeURIComponent(packageName)}` +
+      `/purchases/productsv2/tokens/${encodeURIComponent(purchaseToken)}`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 30000,
+  });
+
+  return response.data || null;
+}
+
+function localizarLineItemProdutoAvulso(compraGoogle, googleProductId) {
+  const itens = Array.isArray(compraGoogle?.productLineItem)
+    ? compraGoogle.productLineItem
+    : [];
+
+  return (
+    itens.find(
+      (item) =>
+        String(item?.productId || '').trim() ===
+        String(googleProductId || '').trim()
+    ) || null
+  );
+}
+
+function mapearStatusAvulsoGoogle(compraGoogle) {
+  const estado = String(
+    compraGoogle?.purchaseStateContext?.purchaseState || ''
+  )
+    .trim()
+    .toUpperCase();
+
+  if (estado === 'PURCHASED') {
+    return {
+      statusGoogle: estado,
+      statusInterno: 'pago',
+      pago: true,
+      processando: false,
+    };
+  }
+
+  if (estado === 'PENDING') {
+    return {
+      statusGoogle: estado,
+      statusInterno: 'pagamento_pendente',
+      pago: false,
+      processando: true,
+    };
+  }
+
+  if (estado === 'CANCELLED') {
+    return {
+      statusGoogle: estado,
+      statusInterno: 'cancelado',
+      pago: false,
+      processando: false,
+    };
+  }
+
+  return {
+    statusGoogle: estado || 'DESCONHECIDO',
+    statusInterno: 'desconhecido',
+    pago: false,
+    processando: false,
+  };
+}
+
+// ============================================================
+// GOOGLE PLAY - CANCELAR RENOVAÇÃO DE ASSINATURA V2
+// ============================================================
+//
+// Usado em recorrente -> avulso somente DEPOIS de o novo pagamento
+// avulso estar confirmado.
+//
+// USER_REQUESTED_STOP_RENEWALS interrompe a próxima renovação sem
+// reembolsar o período já pago.
+//
+async function cancelarRenovacaoAssinaturaGoogleV2(purchaseToken) {
+  const token = String(purchaseToken || '').trim();
+
+  if (!token) {
+    throw new Error('purchaseToken da assinatura anterior não informado.');
+  }
+
+  const packageName = obterGooglePackageName();
+  const accessToken = await obterAccessTokenGoogle();
+
+  logGoogle('GOOGLE_ASSINATURA_CANCELAR_INICIO', {
+    package_name: packageName,
+    purchase_token: token,
+    cancellation_type: 'USER_REQUESTED_STOP_RENEWALS',
+  });
+
+  await axios({
+    method: 'POST',
+    url:
+      `${GOOGLE_ANDROID_PUBLISHER_BASE_URL}` +
+      `/applications/${encodeURIComponent(packageName)}` +
+      `/purchases/subscriptionsv2/tokens/${encodeURIComponent(token)}:cancel`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    data: {
+      cancellationContext: {
+        cancellationType: 'USER_REQUESTED_STOP_RENEWALS',
+      },
+    },
+    timeout: 30000,
+  });
+
+  logGoogle('GOOGLE_ASSINATURA_CANCELAR_OK', {
+    purchase_token: token,
+  });
+
+  return true;
+}
+
+async function marcarAssinaturaAnteriorComoSubstituida({
+  purchaseTokenAnterior,
+  motivo,
+}) {
+  const token = String(purchaseTokenAnterior || '').trim();
+  if (!token) return null;
+
+  return atualizarAssinaturaGooglePorToken(token, {
+    status_assinatura: motivo || 'substituido',
+    cancelado_em: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+}
+
+function extrairLinkedPurchaseToken(assinaturaGoogle) {
+  const token = String(
+    assinaturaGoogle?.linkedPurchaseToken || ''
+  ).trim();
+
+  return token || null;
+}
+
 
 // ============================================================
 // HELPERS DE DIAGNÓSTICO DO SUPABASE
@@ -1329,571 +1686,793 @@ app.get(
 //
 // POST /google/validar-compra
 //
-// Authorization:
-// Bearer <access_token Supabase>
+// Suporta:
+// - avulso -> avulso
+// - avulso -> recorrente
+// - recorrente -> recorrente
+// - recorrente -> avulso
 //
-// Body esperado do checkout_google.dart:
+// REGRA PRINCIPAL:
+// o plano atual só é substituído depois que a NOVA compra foi confirmada
+// diretamente na Google Play Developer API.
 //
-// {
-//   "usuario_id": "...",
-//   "plano_id": "...",
-//   "google_product_id": "...",
-//   "google_base_plan_id": "...",
-//   "purchase_token": "...",
-//   "purchase_id": "...",
-//   "transaction_date": "...",
-//   "verification_source": "..."
-// }
-//
-// IMPORTANTE:
-// O backend NÃO confia nos IDs enviados pelo Flutter.
-// Ele confere:
-// - usuário autenticado
-// - plano do Supabase
-// - productId retornado pelo Google
-// - basePlanId retornado pelo Google
+// O backend não confia em "pago=true" vindo do Flutter.
 // ============================================================
 
 app.post(
   '/google/validar-compra',
 
   async (req, res) => {
-    console.log(
-      '=========================================='
-    );
+    const requestId = req.googleRequestId || 'sem-id';
 
-    console.log(
-      '>>> GOOGLE PLAY - VALIDAR COMPRA'
-    );
-
-    console.log(
-      '=========================================='
-    );
+    console.log('==========================================');
+    console.log('>>> GOOGLE PLAY - VALIDAR COMPRA/TROCA');
+    console.log('==========================================');
 
     try {
       // --------------------------------------------------------
-      // USUÁRIO
+      // 1. AUTENTICAÇÃO SUPABASE
       // --------------------------------------------------------
-
-      const usuario =
-        await obterUsuarioSupabaseDoBearer(
-          req
-        );
+      const usuario = await obterUsuarioSupabaseDoBearer(req);
 
       if (!usuario?.id) {
-        return res
-          .status(401)
-          .json({
-            success:
-              false,
+        logGoogle('VALIDAR_NEGADO_SEM_AUTH', {
+          request_id: requestId,
+        });
 
-            validado:
-              false,
-
-            error:
-              'Usuário não autenticado.',
-          });
+        return res.status(401).json({
+          success: false,
+          validado: false,
+          error: 'Usuário não autenticado.',
+        });
       }
 
-      const usuarioIdBody =
-        String(
-          req.body?.usuario_id ||
-          ''
-        ).trim();
+      const usuarioIdBody = String(
+        req.body?.usuario_id || ''
+      ).trim();
 
       if (
         usuarioIdBody &&
         usuarioIdBody !== usuario.id
       ) {
-        return res
-          .status(403)
-          .json({
-            success:
-              false,
+        logGoogle('VALIDAR_NEGADO_USUARIO_DIVERGENTE', {
+          request_id: requestId,
+          usuario_auth: usuario.id,
+          usuario_body: usuarioIdBody,
+        });
 
-            validado:
-              false,
-
-            error:
-              'O usuario_id informado não corresponde ao usuário autenticado.',
-          });
+        return res.status(403).json({
+          success: false,
+          validado: false,
+          error:
+            'O usuario_id informado não corresponde ao usuário autenticado.',
+        });
       }
 
       // --------------------------------------------------------
-      // BODY
+      // 2. BODY
       // --------------------------------------------------------
+      const planoId = String(
+        req.body?.plano_id || ''
+      ).trim();
 
-      const planoId =
-        String(
-          req.body?.plano_id ||
-          ''
-        ).trim();
+      const googleProductIdRecebido = String(
+        req.body?.google_product_id || ''
+      ).trim();
 
-      const googleProductIdRecebido =
-        String(
-          req.body?.google_product_id ||
-          ''
-        ).trim();
+      const googleBasePlanIdRecebido = String(
+        req.body?.google_base_plan_id || ''
+      ).trim();
 
-      const googleBasePlanIdRecebido =
-        String(
-          req.body?.google_base_plan_id ||
-          ''
-        ).trim();
+      const purchaseToken = String(
+        req.body?.purchase_token || ''
+      ).trim();
 
-      const purchaseToken =
-        String(
-          req.body?.purchase_token ||
-          ''
-        ).trim();
+      const tipoCompraRecebido = String(
+        req.body?.tipo_compra || ''
+      )
+        .trim()
+        .toLowerCase();
 
-      if (
-        !planoId ||
-        !purchaseToken
-      ) {
-        return res
-          .status(400)
-          .json({
-            success:
-              false,
+      const recorrenteRecebido =
+        req.body?.recorrente === true ||
+        tipoCompraRecebido === 'recorrente';
 
-            validado:
-              false,
+      const tipoCompra =
+        recorrenteRecebido ? 'recorrente' : 'avulso';
 
-            error:
-              'plano_id e purchase_token são obrigatórios.',
-          });
+      const tipoTrocaRecebido = String(
+        req.body?.tipo_troca || ''
+      )
+        .trim()
+        .toLowerCase();
+
+      const purchaseTokenAnterior = String(
+        req.body?.purchase_token_anterior || ''
+      ).trim();
+
+      const googleProductIdAnterior = String(
+        req.body?.google_product_id_anterior || ''
+      ).trim();
+
+      const googleBasePlanIdAnterior = String(
+        req.body?.google_base_plan_id_anterior || ''
+      ).trim();
+
+      if (!planoId || !purchaseToken) {
+        return res.status(400).json({
+          success: false,
+          validado: false,
+          error: 'plano_id e purchase_token são obrigatórios.',
+        });
       }
 
-      // --------------------------------------------------------
-      // PLANO NO SUPABASE
-      // --------------------------------------------------------
+      const tiposTrocaPermitidos = new Set([
+        'avulso_para_avulso',
+        'avulso_para_recorrente',
+        'recorrente_para_recorrente',
+        'recorrente_para_avulso',
+      ]);
 
-      const plano =
-        await buscarPlanoGooglePorId(
-          planoId
-        );
+      const tipoTroca = tiposTrocaPermitidos.has(tipoTrocaRecebido)
+        ? tipoTrocaRecebido
+        : recorrenteRecebido
+          ? 'avulso_para_recorrente'
+          : 'avulso_para_avulso';
+
+      logGoogle('VALIDAR_BODY_OK', {
+        request_id: requestId,
+        usuario_id: usuario.id,
+        plano_id: planoId,
+        google_product_id: googleProductIdRecebido,
+        google_base_plan_id: googleBasePlanIdRecebido || null,
+        purchase_token: purchaseToken,
+        tipo_compra: tipoCompra,
+        tipo_troca: tipoTroca,
+        purchase_token_anterior: purchaseTokenAnterior || null,
+        google_product_id_anterior: googleProductIdAnterior || null,
+        google_base_plan_id_anterior: googleBasePlanIdAnterior || null,
+      });
+
+      // --------------------------------------------------------
+      // 3. PLANO NO SUPABASE
+      // --------------------------------------------------------
+      const plano = await buscarPlanoGooglePorId(planoId);
 
       if (!plano) {
-        return res
-          .status(404)
-          .json({
-            success:
-              false,
+        return res.status(404).json({
+          success: false,
+          validado: false,
+          error: 'Plano não encontrado no Supabase.',
+        });
+      }
 
-            validado:
-              false,
+      if (plano.google_ativo !== true) {
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'O pagamento Google ainda não está ativo para este plano.',
+        });
+      }
 
-            error:
-              'Plano não encontrado no Supabase.',
-          });
+      const googleProductIdEsperado = String(
+        plano.google_product_id || ''
+      ).trim();
+
+      const googleBasePlanIdEsperado = String(
+        plano.google_base_plan_id || ''
+      ).trim();
+
+      if (!googleProductIdEsperado) {
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'O plano não possui google_product_id configurado.',
+        });
       }
 
       if (
-        plano.google_ativo !== true
-      ) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            validado:
-              false,
-
-            error:
-              'O pagamento Google ainda não está ativo para este plano.',
-          });
-      }
-
-      const googleProductIdEsperado =
-        String(
-          plano.google_product_id ||
-          ''
-        ).trim();
-
-      const googleBasePlanIdEsperado =
-        String(
-          plano.google_base_plan_id ||
-          ''
-        ).trim();
-
-      if (
-        !googleProductIdEsperado ||
+        tipoCompra === 'recorrente' &&
         !googleBasePlanIdEsperado
       ) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            validado:
-              false,
-
-            error:
-              'O plano não possui google_product_id/google_base_plan_id configurados.',
-          });
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'O plano recorrente não possui google_base_plan_id configurado.',
+        });
       }
 
       if (
         googleProductIdRecebido &&
-        googleProductIdRecebido !==
-          googleProductIdEsperado
+        googleProductIdRecebido !== googleProductIdEsperado
       ) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            validado:
-              false,
-
-            error:
-              'google_product_id enviado pelo app não corresponde ao plano do Supabase.',
-          });
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'google_product_id enviado pelo app não corresponde ao plano do Supabase.',
+        });
       }
 
       if (
+        tipoCompra === 'recorrente' &&
         googleBasePlanIdRecebido &&
-        googleBasePlanIdRecebido !==
-          googleBasePlanIdEsperado
+        googleBasePlanIdRecebido !== googleBasePlanIdEsperado
       ) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            validado:
-              false,
-
-            error:
-              'google_base_plan_id enviado pelo app não corresponde ao plano do Supabase.',
-          });
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'google_base_plan_id enviado pelo app não corresponde ao plano do Supabase.',
+        });
       }
 
-      // --------------------------------------------------------
-      // CONSULTA DIRETA AO GOOGLE
-      // --------------------------------------------------------
+      logGoogle('PLANO_SUPABASE_VALIDADO', {
+        request_id: requestId,
+        plano_id: plano.id,
+        nome_plano: plano.nome_plano,
+        product_id: googleProductIdEsperado,
+        base_plan_id:
+          tipoCompra === 'recorrente'
+            ? googleBasePlanIdEsperado
+            : null,
+        tipo_compra: tipoCompra,
+      });
 
-      const assinaturaGoogle =
-        await consultarAssinaturaGoogle(
-          purchaseToken
-        );
+      // --------------------------------------------------------
+      // 4. IDEMPOTÊNCIA / PROPRIEDADE DO TOKEN
+      // --------------------------------------------------------
+      const registroExistente =
+        await buscarAssinaturaGooglePorToken(purchaseToken);
 
-      const subscriptionState =
-        String(
-          assinaturaGoogle
-            ?.subscriptionState ||
-          ''
+      if (
+        registroExistente &&
+        String(registroExistente.usuario_id || '') !== String(usuario.id)
+      ) {
+        logGoogle('TOKEN_JA_PERTENCE_OUTRO_USUARIO', {
+          request_id: requestId,
+          purchase_token: purchaseToken,
+          usuario_solicitante: usuario.id,
+          usuario_registrado: registroExistente.usuario_id,
+        });
+
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'Este purchase_token já está associado a outro usuário.',
+        });
+      }
+
+      // ========================================================
+      // 5A. COMPRA RECORRENTE
+      // ========================================================
+      if (tipoCompra === 'recorrente') {
+        logGoogle('RECORRENTE_CONSULTA_INICIO', {
+          request_id: requestId,
+          purchase_token: purchaseToken,
+        });
+
+        const assinaturaGoogle =
+          await consultarAssinaturaGoogle(purchaseToken);
+
+        const subscriptionState = String(
+          assinaturaGoogle?.subscriptionState || ''
         ).trim();
 
-      const acknowledgementState =
-        String(
-          assinaturaGoogle
-            ?.acknowledgementState ||
-          ''
+        const acknowledgementState = String(
+          assinaturaGoogle?.acknowledgementState || ''
         ).trim();
 
-      const lineItem =
-        localizarLineItemDoProduto(
+        const lineItem = localizarLineItemDoProduto(
           assinaturaGoogle,
           googleProductIdEsperado
         );
 
-      if (!lineItem) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            validado:
-              false,
-
+        if (!lineItem) {
+          return res.status(409).json({
+            success: false,
+            validado: false,
             error:
-              'O purchase_token é válido, mas não pertence ao produto Google deste plano.',
+              'O purchase_token é válido, mas não pertence ao produto recorrente deste plano.',
           });
-      }
+        }
 
-      const productIdGoogle =
-        String(
-          lineItem.productId ||
-          ''
+        const productIdGoogle = String(
+          lineItem.productId || ''
         ).trim();
 
-      const basePlanIdGoogle =
-        extrairBasePlanId(
-          lineItem
-        );
+        const basePlanIdGoogle =
+          extrairBasePlanId(lineItem);
 
-      if (
-        productIdGoogle !==
-        googleProductIdEsperado
-      ) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            validado:
-              false,
-
+        if (productIdGoogle !== googleProductIdEsperado) {
+          return res.status(409).json({
+            success: false,
+            validado: false,
             error:
               'Produto retornado pelo Google não corresponde ao produto configurado no Supabase.',
           });
-      }
+        }
 
-      if (
-        basePlanIdGoogle &&
-        basePlanIdGoogle !==
-          googleBasePlanIdEsperado
-      ) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            validado:
-              false,
-
+        if (
+          basePlanIdGoogle &&
+          basePlanIdGoogle !== googleBasePlanIdEsperado
+        ) {
+          return res.status(409).json({
+            success: false,
+            validado: false,
             error:
               'Base plan retornado pelo Google não corresponde ao plano configurado no Supabase.',
           });
-      }
+        }
 
-      //
-      // Se por alguma razão a API não devolver offerDetails,
-      // não bloqueamos somente por ausência; o productId ainda
-      // precisa obrigatoriamente ser o correto.
-      //
-      if (!basePlanIdGoogle) {
-        console.warn(
-          '>>> Google não retornou basePlanId em offerDetails para este lineItem.'
-        );
-      }
+        if (!basePlanIdGoogle) {
+          console.warn(
+            '>>> Google não retornou basePlanId em offerDetails para este lineItem.'
+          );
+        }
 
-      const expiryTime =
-        lineItem.expiryTime ||
-        null;
+        const expiryTime = lineItem.expiryTime || null;
+        const startTime = assinaturaGoogle?.startTime || null;
+        const orderId = extrairOrderId(lineItem);
+        const autoRenovacao = extrairAutoRenovacao(lineItem);
+        const linkedPurchaseToken =
+          extrairLinkedPurchaseToken(assinaturaGoogle);
 
-      const startTime =
-        assinaturaGoogle
-          ?.startTime ||
-        null;
-
-      const orderId =
-        extrairOrderId(
-          lineItem
-        );
-
-      const autoRenovacao =
-        extrairAutoRenovacao(
-          lineItem
-        );
-
-      const {
-        statusInterno,
-        assinaturaAtiva,
-      } =
-        mapearStatusGoogleParaInterno(
+        const {
+          statusInterno,
+          assinaturaAtiva,
+        } = mapearStatusGoogleParaInterno(
           subscriptionState,
           expiryTime
         );
 
-      // --------------------------------------------------------
-      // REGISTRA / ATUALIZA NO SUPABASE
-      // --------------------------------------------------------
+        const agoraIso = new Date().toISOString();
 
-      const agoraIso =
-        new Date()
-          .toISOString();
-
-      const registro =
-        await inserirOuAtualizarAssinaturaGoogle({
-          usuario_id:
-            usuario.id,
-
-          plano_id:
-            plano.id,
-
-          google_product_id:
-            googleProductIdEsperado,
-
-          google_base_plan_id:
-            googleBasePlanIdEsperado,
-
-          purchase_token:
-            purchaseToken,
-
-          google_order_id:
-            orderId,
-
-          status_assinatura:
-            statusInterno,
-
-          acknowledgement_state:
-            acknowledgementState ||
-            null,
-
-          auto_renovacao:
-            autoRenovacao,
-
-          data_inicio:
-            startTime ||
-            null,
-
-          data_expiracao:
-            expiryTime ||
-            null,
-
-          data_ultimo_pagamento:
-            assinaturaAtiva
-              ? agoraIso
-              : null,
-
-          cancelado_em:
-            subscriptionState ===
-              'SUBSCRIPTION_STATE_CANCELED'
-                ? agoraIso
-                : null,
-
-          updated_at:
-            agoraIso,
+        logGoogle('RECORRENTE_GOOGLE_RESPOSTA', {
+          request_id: requestId,
+          purchase_token: purchaseToken,
+          subscription_state: subscriptionState,
+          acknowledgement_state: acknowledgementState,
+          product_id: productIdGoogle,
+          base_plan_id: basePlanIdGoogle || null,
+          order_id: orderId,
+          expiry_time: expiryTime,
+          auto_renovacao: autoRenovacao,
+          linked_purchase_token: linkedPurchaseToken,
+          assinatura_ativa: assinaturaAtiva,
+          status_interno: statusInterno,
+          test_purchase: Boolean(assinaturaGoogle?.testPurchase),
         });
 
-      console.log(
-        '>>> Google Play validado.',
-        '| usuario:',
-        usuario.id,
-        '| plano:',
-        plano.id,
-        '| produto:',
-        googleProductIdEsperado,
-        '| status:',
-        subscriptionState,
-        '| interno:',
-        statusInterno,
-        '| ativo:',
-        assinaturaAtiva
-      );
-
-      // --------------------------------------------------------
-      // RESPOSTA PARA O FLUTTER
-      // --------------------------------------------------------
-      //
-      // O checkout_google.dart espera:
-      // success=true
-      // e pelo menos um:
-      // validado=true
-      // purchase_valid=true
-      // assinatura_ativa=true
-      //
-      // Só devolvemos validado=true quando há direito de acesso.
-      // --------------------------------------------------------
-
-      if (!assinaturaAtiva) {
-        return res
-          .status(202)
-          .json({
-            success:
-              true,
-
-            validado:
-              false,
-
-            purchase_valid:
-              false,
-
-            assinatura_ativa:
-              false,
-
-            status_google:
-              subscriptionState,
-
-            status:
-              statusInterno,
-
+        const registro =
+          await inserirOuAtualizarAssinaturaGoogle({
+            usuario_id: usuario.id,
+            plano_id: plano.id,
+            google_product_id: googleProductIdEsperado,
+            google_base_plan_id: googleBasePlanIdEsperado,
+            purchase_token: purchaseToken,
+            google_order_id: orderId,
+            status_assinatura: statusInterno,
             acknowledgement_state:
-              acknowledgementState ||
-              null,
-
-            data_expiracao:
-              expiryTime,
-
-            assinatura:
-              registro,
-
-            message:
-              'A compra foi localizada no Google, mas a assinatura ainda não está em um estado que libere acesso.',
+              acknowledgementState || null,
+            auto_renovacao: autoRenovacao,
+            data_inicio: startTime || null,
+            data_expiracao: expiryTime || null,
+            data_ultimo_pagamento:
+              assinaturaAtiva ? agoraIso : null,
+            cancelado_em:
+              subscriptionState === 'SUBSCRIPTION_STATE_CANCELED'
+                ? agoraIso
+                : null,
+            updated_at: agoraIso,
           });
+
+        if (!assinaturaAtiva) {
+          logGoogle('RECORRENTE_NAO_LIBERADA', {
+            request_id: requestId,
+            status_google: subscriptionState,
+            status_interno: statusInterno,
+          });
+
+          return res.status(202).json({
+            success: true,
+            validado: false,
+            purchase_valid: false,
+            assinatura_ativa: false,
+            processando:
+              statusInterno === 'pagamento_pendente',
+            status_google: subscriptionState,
+            status: statusInterno,
+            acknowledgement_state:
+              acknowledgementState || null,
+            data_expiracao: expiryTime,
+            assinatura: registro,
+            message:
+              'A assinatura foi localizada no Google, mas ainda não está em estado que libere o novo plano. O plano atual foi preservado.',
+          });
+        }
+
+        // ------------------------------------------------------
+        // RECORRENTE -> RECORRENTE
+        // ------------------------------------------------------
+        if (tipoTroca === 'recorrente_para_recorrente') {
+          const anterior =
+            await buscarAssinaturaGoogleAnteriorSegura({
+              usuarioId: usuario.id,
+              purchaseTokenAnterior,
+            });
+
+          logGoogle('TROCA_REC_REC_VALIDADA', {
+            request_id: requestId,
+            token_novo: purchaseToken,
+            token_anterior: purchaseTokenAnterior || null,
+            linked_purchase_token: linkedPurchaseToken,
+            registro_anterior_encontrado: Boolean(anterior),
+          });
+
+          // O Billing Flow do Google faz a substituição. linkedPurchaseToken
+          // é a evidência server-side da relação quando o Google o fornece.
+          if (
+            purchaseTokenAnterior &&
+            linkedPurchaseToken &&
+            linkedPurchaseToken !== purchaseTokenAnterior
+          ) {
+            logGoogle('TROCA_REC_REC_LINK_DIVERGENTE', {
+              request_id: requestId,
+              token_anterior: purchaseTokenAnterior,
+              linked_purchase_token: linkedPurchaseToken,
+            });
+
+            return res.status(409).json({
+              success: false,
+              validado: false,
+              error:
+                'O Google confirmou a nova assinatura, mas o linkedPurchaseToken não corresponde à assinatura anterior informada.',
+            });
+          }
+
+          if (
+            purchaseTokenAnterior &&
+            purchaseTokenAnterior !== purchaseToken
+          ) {
+            await marcarAssinaturaAnteriorComoSubstituida({
+              purchaseTokenAnterior,
+              motivo: 'substituido',
+            });
+
+            logGoogle('TROCA_REC_REC_ANTERIOR_MARCADA', {
+              request_id: requestId,
+              purchase_token_anterior: purchaseTokenAnterior,
+            });
+          }
+        }
+
+        // ------------------------------------------------------
+        // AVULSO -> RECORRENTE ou RECORRENTE -> RECORRENTE
+        // Só agora sincroniza o plano ativo.
+        // ------------------------------------------------------
+        const usuarioAtualizado =
+          await atualizarPlanoAtivoUsuarioGoogle({
+            usuarioId: usuario.id,
+            plano,
+            recorrente: true,
+            dataAtivacao: startTime || agoraIso,
+          });
+
+        logGoogle('RECORRENTE_LIBERADA', {
+          request_id: requestId,
+          usuario_id: usuario.id,
+          plano_id: plano.id,
+          tipo_troca: tipoTroca,
+        });
+
+        return res.json({
+          success: true,
+          validado: true,
+          purchase_valid: true,
+          assinatura_ativa: true,
+          plano_ativo: true,
+          pago: true,
+          recorrente: true,
+          tipo_troca: tipoTroca,
+          status_google: subscriptionState,
+          status: statusInterno,
+          acknowledgement_state:
+            acknowledgementState || null,
+          google_product_id: googleProductIdEsperado,
+          google_base_plan_id: googleBasePlanIdEsperado,
+          google_order_id: orderId,
+          linked_purchase_token: linkedPurchaseToken,
+          data_inicio: startTime,
+          data_expiracao: expiryTime,
+          auto_renovacao: autoRenovacao,
+          test_purchase:
+            assinaturaGoogle?.testPurchase ? true : false,
+          assinatura: registro,
+          usuario_plano: usuarioAtualizado,
+        });
       }
 
+      // ========================================================
+      // 5B. COMPRA AVULSA / ONE-TIME PRODUCT
+      // ========================================================
+      logGoogle('AVULSO_CONSULTA_INICIO', {
+        request_id: requestId,
+        purchase_token: purchaseToken,
+      });
+
+      const compraGoogle =
+        await consultarProdutoAvulsoGoogle(purchaseToken);
+
+      const item = localizarLineItemProdutoAvulso(
+        compraGoogle,
+        googleProductIdEsperado
+      );
+
+      if (!item) {
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'O purchase_token é válido, mas não pertence ao produto avulso deste plano.',
+        });
+      }
+
+      const productIdGoogle = String(
+        item.productId || ''
+      ).trim();
+
+      if (productIdGoogle !== googleProductIdEsperado) {
+        return res.status(409).json({
+          success: false,
+          validado: false,
+          error:
+            'Produto avulso retornado pelo Google não corresponde ao plano do Supabase.',
+        });
+      }
+
+      const {
+        statusGoogle,
+        statusInterno,
+        pago,
+        processando,
+      } = mapearStatusAvulsoGoogle(compraGoogle);
+
+      const acknowledgementState = String(
+        compraGoogle?.acknowledgementState || ''
+      ).trim();
+
+      const orderId = compraGoogle?.orderId
+        ? String(compraGoogle.orderId).trim()
+        : null;
+
+      const purchaseCompletionTime =
+        compraGoogle?.purchaseCompletionTime || null;
+
+      const consumptionState = String(
+        item?.productOfferDetails?.consumptionState || ''
+      ).trim();
+
+      const agoraIso = new Date().toISOString();
+
+      logGoogle('AVULSO_GOOGLE_RESPOSTA', {
+        request_id: requestId,
+        purchase_token: purchaseToken,
+        purchase_state: statusGoogle,
+        status_interno: statusInterno,
+        product_id: productIdGoogle,
+        order_id: orderId,
+        acknowledgement_state: acknowledgementState,
+        consumption_state: consumptionState,
+        purchase_completion_time: purchaseCompletionTime,
+        test_purchase: Boolean(compraGoogle?.testPurchaseContext),
+      });
+
+      // Reutilizamos tab_assinaturas_google como histórico Google.
+      // Para avulso, base plan é NULL, auto_renovacao=false e não há expiry.
+      const registro =
+        await inserirOuAtualizarAssinaturaGoogle({
+          usuario_id: usuario.id,
+          plano_id: plano.id,
+          google_product_id: googleProductIdEsperado,
+          google_base_plan_id: null,
+          purchase_token: purchaseToken,
+          google_order_id: orderId,
+          status_assinatura: statusInterno,
+          acknowledgement_state:
+            acknowledgementState || null,
+          auto_renovacao: false,
+          data_inicio:
+            purchaseCompletionTime || agoraIso,
+          data_expiracao: null,
+          data_ultimo_pagamento:
+            pago
+              ? purchaseCompletionTime || agoraIso
+              : null,
+          cancelado_em:
+            statusGoogle === 'CANCELLED'
+              ? agoraIso
+              : null,
+          updated_at: agoraIso,
+        });
+
+      if (!pago) {
+        logGoogle('AVULSO_NAO_LIBERADO', {
+          request_id: requestId,
+          status_google: statusGoogle,
+          status_interno: statusInterno,
+          processando,
+        });
+
+        return res.status(processando ? 202 : 409).json({
+          success: processando,
+          validado: false,
+          purchase_valid: false,
+          assinatura_ativa: false,
+          plano_ativo: false,
+          pago: false,
+          processando,
+          status_google: statusGoogle,
+          status: statusInterno,
+          compra: registro,
+          message: processando
+            ? 'Pagamento avulso pendente no Google. O plano atual foi preservado.'
+            : 'A compra avulsa não está paga e o plano não foi alterado.',
+        });
+      }
+
+      // --------------------------------------------------------
+      // RECORRENTE -> AVULSO
+      // Nova compra já está PAGA. Somente agora cancelamos a próxima
+      // renovação da assinatura antiga.
+      // --------------------------------------------------------
+      let assinaturaAnteriorCancelada = false;
+
+      if (tipoTroca === 'recorrente_para_avulso') {
+        if (!purchaseTokenAnterior) {
+          logGoogle('REC_AVULSO_SEM_TOKEN_ANTERIOR', {
+            request_id: requestId,
+            usuario_id: usuario.id,
+          });
+
+          return res.status(409).json({
+            success: false,
+            validado: false,
+            purchase_valid: true,
+            pagamento_confirmado: true,
+            pago: true,
+            troca_plano: false,
+            status: 'pagamento_confirmado_aguardando_troca',
+            error:
+              'O pagamento avulso foi confirmado, mas não foi possível identificar com segurança a assinatura recorrente anterior. Não compre novamente; a troca deve ser retomada.',
+          });
+        }
+
+        const anterior =
+          await buscarAssinaturaGoogleAnteriorSegura({
+            usuarioId: usuario.id,
+            purchaseTokenAnterior,
+          });
+
+        if (!anterior) {
+          return res.status(409).json({
+            success: false,
+            validado: false,
+            purchase_valid: true,
+            pagamento_confirmado: true,
+            pago: true,
+            troca_plano: false,
+            status: 'pagamento_confirmado_aguardando_troca',
+            error:
+              'O pagamento avulso foi confirmado, mas a assinatura anterior não foi encontrada no histórico local. Não compre novamente.',
+          });
+        }
+
+        try {
+          await cancelarRenovacaoAssinaturaGoogleV2(
+            purchaseTokenAnterior
+          );
+
+          assinaturaAnteriorCancelada = true;
+
+          await atualizarAssinaturaGooglePorToken(
+            purchaseTokenAnterior,
+            {
+              status_assinatura: 'cancelado_com_acesso',
+              cancelado_em: agoraIso,
+              auto_renovacao: false,
+              updated_at: agoraIso,
+            }
+          );
+
+          logGoogle('REC_AVULSO_ANTERIOR_CANCELADA', {
+            request_id: requestId,
+            purchase_token_anterior: purchaseTokenAnterior,
+            plano_anterior: anterior.plano_id,
+          });
+        } catch (cancelError) {
+          logGoogle('REC_AVULSO_ERRO_CANCELAMENTO', {
+            request_id: requestId,
+            purchase_token_anterior: purchaseTokenAnterior,
+            http_status: cancelError.response?.status || null,
+            erro:
+              cancelError.response?.data?.error?.message ||
+              cancelError.message,
+          });
+
+          return res.status(409).json({
+            success: false,
+            validado: false,
+            purchase_valid: true,
+            pagamento_confirmado: true,
+            pago: true,
+            troca_plano: false,
+            status: 'pagamento_confirmado_aguardando_troca',
+            error:
+              'O novo pagamento avulso foi confirmado, mas o Google ainda não confirmou o cancelamento da renovação anterior. Não compre novamente.',
+          });
+        }
+      }
+
+      // --------------------------------------------------------
+      // AVULSO -> AVULSO ou RECORRENTE -> AVULSO
+      // Só chegamos aqui com pagamento confirmado.
+      // --------------------------------------------------------
+      const usuarioAtualizado =
+        await atualizarPlanoAtivoUsuarioGoogle({
+          usuarioId: usuario.id,
+          plano,
+          recorrente: false,
+          dataAtivacao:
+            purchaseCompletionTime || agoraIso,
+        });
+
+      logGoogle('AVULSO_LIBERADO', {
+        request_id: requestId,
+        usuario_id: usuario.id,
+        plano_id: plano.id,
+        tipo_troca: tipoTroca,
+        assinatura_anterior_cancelada:
+          assinaturaAnteriorCancelada,
+      });
+
       return res.json({
-        success:
-          true,
-
-        validado:
-          true,
-
-        purchase_valid:
-          true,
-
-        assinatura_ativa:
-          true,
-
-        status_google:
-          subscriptionState,
-
-        status:
-          statusInterno,
-
+        success: true,
+        validado: true,
+        purchase_valid: true,
+        assinatura_ativa: false,
+        plano_ativo: true,
+        pagamento_confirmado: true,
+        pago: true,
+        troca_plano: true,
+        recorrente: false,
+        tipo_troca: tipoTroca,
+        status_google: statusGoogle,
+        status: statusInterno,
+        google_product_id: googleProductIdEsperado,
+        google_base_plan_id: null,
+        google_order_id: orderId,
         acknowledgement_state:
-          acknowledgementState ||
-          null,
-
-        google_product_id:
-          googleProductIdEsperado,
-
-        google_base_plan_id:
-          googleBasePlanIdEsperado,
-
-        google_order_id:
-          orderId,
-
-        data_inicio:
-          startTime,
-
-        data_expiracao:
-          expiryTime,
-
-        auto_renovacao:
-          autoRenovacao,
-
+          acknowledgementState || null,
+        consumption_state:
+          consumptionState || null,
+        data_pagamento:
+          purchaseCompletionTime || agoraIso,
+        assinatura_anterior_cancelada:
+          assinaturaAnteriorCancelada,
         test_purchase:
-          assinaturaGoogle
-            ?.testPurchase
-            ? true
-            : false,
-
-        assinatura:
-          registro,
+          compraGoogle?.testPurchaseContext ? true : false,
+        compra: registro,
+        usuario_plano: usuarioAtualizado,
       });
 
     } catch (error) {
-      console.error(
-        '>>> ERRO AO VALIDAR COMPRA GOOGLE:',
-        error.response?.data ||
-        error.message
-      );
-
       const statusHttp =
-        error.response?.status ||
-        500;
+        error.response?.status || 500;
 
       let mensagem =
         error.response?.data?.error?.message ||
@@ -1901,28 +2480,27 @@ app.post(
         error.message ||
         'Erro desconhecido ao validar compra Google.';
 
-      if (
-        typeof mensagem !==
-        'string'
-      ) {
-        mensagem =
-          JSON.stringify(
-            mensagem
-          );
+      if (typeof mensagem !== 'string') {
+        mensagem = JSON.stringify(mensagem);
       }
 
-      return res
-        .status(statusHttp)
-        .json({
-          success:
-            false,
+      logGoogle('VALIDAR_ERRO', {
+        request_id: requestId,
+        http_status: statusHttp,
+        erro: mensagem,
+        google_status: error.response?.status || null,
+      });
 
-          validado:
-            false,
+      console.error(
+        '>>> ERRO AO VALIDAR COMPRA GOOGLE:',
+        error.response?.data || error.message
+      );
 
-          error:
-            mensagem,
-        });
+      return res.status(statusHttp).json({
+        success: false,
+        validado: false,
+        error: mensagem,
+      });
     }
   }
 );
