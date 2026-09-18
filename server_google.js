@@ -396,7 +396,7 @@ async function buscarPlanoGooglePorId(planoId) {
 
       params: {
         select:
-          'id,nome_plano,google_product_id,google_base_plan_id,google_ativo',
+          'id,nome_plano,google_product_id,google_product_id_avulso,google_base_plan_id,google_ativo',
 
         id:
           `eq.${planoId}`,
@@ -810,7 +810,7 @@ async function diagnosticarSupabase() {
 
         params: {
           select:
-            'id,nome_plano,google_product_id,google_base_plan_id,google_ativo',
+            'id,nome_plano,google_product_id,google_product_id_avulso,google_base_plan_id,google_ativo',
 
           limit:
             5,
@@ -1470,16 +1470,29 @@ app.post(
           ''
         ).trim();
 
+      const googleProductIdAvulso =
+        String(
+          plano.google_product_id_avulso ||
+          ''
+        ).trim();
+
       const googleBasePlanId =
         String(
           plano.google_base_plan_id ||
           ''
         ).trim();
 
-      const configurado =
+      const configuradoRecorrente =
         plano.google_ativo === true &&
         googleProductId.length > 0 &&
         googleBasePlanId.length > 0;
+
+      const configuradoAvulso =
+        plano.google_ativo === true &&
+        googleProductIdAvulso.length > 0;
+
+      const configurado =
+        configuradoRecorrente || configuradoAvulso;
 
       return res.json({
         success:
@@ -1502,8 +1515,17 @@ app.post(
             google_product_id:
               googleProductId || null,
 
+            google_product_id_avulso:
+              googleProductIdAvulso || null,
+
             google_base_plan_id:
               googleBasePlanId || null,
+
+            configurado_recorrente:
+              configuradoRecorrente,
+
+            configurado_avulso:
+              configuradoAvulso,
           },
 
         message:
@@ -1864,9 +1886,18 @@ app.post(
         });
       }
 
-      const googleProductIdEsperado = String(
+      const googleProductIdRecorrente = String(
         plano.google_product_id || ''
       ).trim();
+
+      const googleProductIdAvulso = String(
+        plano.google_product_id_avulso || ''
+      ).trim();
+
+      const googleProductIdEsperado =
+        tipoCompra === 'recorrente'
+          ? googleProductIdRecorrente
+          : googleProductIdAvulso;
 
       const googleBasePlanIdEsperado = String(
         plano.google_base_plan_id || ''
@@ -1877,7 +1908,9 @@ app.post(
           success: false,
           validado: false,
           error:
-            'O plano não possui google_product_id configurado.',
+            tipoCompra === 'recorrente'
+              ? 'O plano não possui google_product_id recorrente configurado.'
+              : 'O plano não possui google_product_id_avulso configurado.',
         });
       }
 
@@ -1901,7 +1934,9 @@ app.post(
           success: false,
           validado: false,
           error:
-            'google_product_id enviado pelo app não corresponde ao plano do Supabase.',
+            tipoCompra === 'recorrente'
+              ? 'google_product_id recorrente enviado pelo app não corresponde ao plano do Supabase.'
+              : 'google_product_id_avulso enviado pelo app não corresponde ao plano do Supabase.',
         });
       }
 
