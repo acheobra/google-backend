@@ -710,6 +710,144 @@ function mapearStatusAvulsoGoogle(compraGoogle) {
 }
 
 // ============================================================
+// SELO DE VERIFICAÇÃO - COMPRA AVULSA INDEPENDENTE DOS PLANOS
+// ============================================================
+// A tabela tab_pagamentos_selo_google é criada pelo SQL entregue à parte.
+// Nenhum campo de tab_usuarios ou tab_assinaturas_google é alterado.
+
+const GOOGLE_SELO_PRODUCT_ID = 'selo_verificacao_avulso';
+
+async function buscarConfiguracaoSeloGoogle(seloId) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_planos_selos`,
+    params: { select: 'id', id: `eq.${seloId}`, limit: 1 },
+    headers: obterHeadersSupabase(), timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data[0] || null : null;
+}
+
+async function buscarPagamentoSeloPorToken(purchaseToken) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_selo_google`,
+    params: { select: '*', purchase_token: `eq.${purchaseToken}`, limit: 1 },
+    headers: obterHeadersSupabase(), timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data[0] || null : null;
+}
+
+async function salvarPagamentoSeloGoogle(dados) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'POST',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_selo_google`,
+    params: { on_conflict: 'purchase_token' },
+    headers: {
+      ...obterHeadersSupabase(),
+      Prefer: 'resolution=merge-duplicates,return=representation',
+    },
+    data: dados, timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data[0] || null : null;
+}
+
+async function reconhecerCompraSeloGoogle(purchaseToken, productId) {
+  const packageName = obterGooglePackageName();
+  const accessToken = await obterAccessTokenGoogle();
+  await axios({
+    method: 'POST',
+    url: `${GOOGLE_ANDROID_PUBLISHER_BASE_URL}` +
+      `/applications/${encodeURIComponent(packageName)}` +
+      `/purchases/products/${encodeURIComponent(productId)}` +
+      `/tokens/${encodeURIComponent(purchaseToken)}:acknowledge`,
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    data: {}, timeout: 30000,
+  });
+}
+
+async function validarPagamentoSeloGoogle({ req, res, usuario, planoId, purchaseToken, googleProductIdRecebido }) {
+  const requestId = req.googleRequestId || 'sem-id';
+  if (!planoId || !purchaseToken) {
+    return res.status(400).json({ success: false, validado: false, error: 'plano_id e purchase_token são obrigatórios.' });
+  }
+  if (googleProductIdRecebido && googleProductIdRecebido !== GOOGLE_SELO_PRODUCT_ID) {
+    return res.status(409).json({ success: false, validado: false, error: 'Produto Google diferente do selo de verificação.' });
+  }
+  const selo = await buscarConfiguracaoSeloGoogle(planoId);
+  if (!selo) {
+    return res.status(404).json({ success: false, validado: false, error: 'Configuração do selo não encontrada em tab_planos_selos.' });
+  }
+
+  // Evita usar o token de um plano ou de outro usuário no pagamento do selo.
+  const [registroSeloAnterior, registroPlanoAnterior] = await Promise.all([
+    buscarPagamentoSeloPorToken(purchaseToken),
+    buscarAssinaturaGooglePorToken(purchaseToken),
+  ]);
+  if (registroPlanoAnterior || (registroSeloAnterior &&
+      (String(registroSeloAnterior.usuario_id) !== String(usuario.id) ||
+       String(registroSeloAnterior.selo_id) !== String(selo.id)))) {
+    return res.status(409).json({ success: false, validado: false, error: 'Este token já está vinculado a outra compra ou usuário.' });
+  }
+
+  const compraGoogle = await consultarProdutoAvulsoGoogle(purchaseToken);
+  const item = localizarLineItemProdutoAvulso(compraGoogle, GOOGLE_SELO_PRODUCT_ID);
+  if (!item) {
+    return res.status(409).json({ success: false, validado: false, error: 'O Google não confirmou o produto selo_verificacao_avulso para este token.' });
+  }
+  const estado = mapearStatusAvulsoGoogle(compraGoogle);
+  if (!estado.pago) {
+    logGoogle('SELO_COMPRA_NAO_PAGA', { request_id: requestId, status_google: estado.statusGoogle });
+    return res.status(estado.processando ? 202 : 409).json({
+      success: estado.processando, validado: false, purchase_valid: false,
+      pago: false, processando: estado.processando, status: estado.statusInterno,
+      status_google: estado.statusGoogle,
+      message: estado.processando ? 'Pagamento do selo ainda pendente no Google.' : 'Pagamento do selo não confirmado pelo Google.',
+    });
+  }
+
+  const agoraIso = new Date().toISOString();
+  const orderId = compraGoogle?.orderId ? String(compraGoogle.orderId) : null;
+  const registro = await salvarPagamentoSeloGoogle({
+    usuario_id: usuario.id,
+    selo_id: selo.id,
+    google_product_id: GOOGLE_SELO_PRODUCT_ID,
+    purchase_token: purchaseToken,
+    google_order_id: orderId,
+    status_pagamento: 'pago',
+    pago_em: compraGoogle?.purchaseCompletionTime || agoraIso,
+    updated_at: agoraIso,
+  });
+  if (!registro) throw new Error('Não foi possível registrar o pagamento do selo.');
+
+  // Reconhecimento obrigatório de produto não consumível; falha não invalida
+  // o pagamento já confirmado e registrado. Não consumir o produto.
+  const acknowledgementState = String(compraGoogle?.acknowledgementState || '');
+  if (acknowledgementState !== 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED') {
+    try {
+      await reconhecerCompraSeloGoogle(purchaseToken, GOOGLE_SELO_PRODUCT_ID);
+    } catch (error) {
+      logGoogle('SELO_ACK_ERRO', { request_id: requestId, http_status: error.response?.status || null, erro: error.response?.data?.error?.message || error.message });
+    }
+  }
+
+  logGoogle('SELO_PAGAMENTO_CONFIRMADO', { request_id: requestId, usuario_id: usuario.id, selo_id: selo.id, google_order_id: orderId });
+  // A aprovação do selo NÃO ocorre aqui: o Flutter ainda precisa enviar
+  // documentos e o administrador ainda precisa validá-los.
+  return res.json({
+    success: true, validado: true, purchase_valid: true,
+    pagamento_confirmado: true, pago: true, plano_ativo: false,
+    assinatura_ativa: false, recorrente: false, tipo_compra: 'avulso',
+    status: 'pago', status_google: estado.statusGoogle,
+    google_product_id: GOOGLE_SELO_PRODUCT_ID,
+    google_order_id: orderId, selo_id: selo.id,
+    compra: registro,
+  });
+}
+
+// ============================================================
 // GOOGLE PLAY - CANCELAR RENOVAÇÃO DE ASSINATURA V2
 // ============================================================
 //
@@ -1863,6 +2001,16 @@ app.post(
         google_product_id_anterior: googleProductIdAnterior || null,
         google_base_plan_id_anterior: googleBasePlanIdAnterior || null,
       });
+
+      // Selo: fluxo independente, sem trocar plano ou cancelar assinatura.
+      if (googleProductIdRecebido === GOOGLE_SELO_PRODUCT_ID) {
+        if (recorrenteRecebido) {
+          return res.status(400).json({ success: false, validado: false, error: 'Selo de verificação é uma compra avulsa.' });
+        }
+        return await validarPagamentoSeloGoogle({
+          req, res, usuario, planoId, purchaseToken, googleProductIdRecebido,
+        });
+      }
 
       // --------------------------------------------------------
       // 3. PLANO NO SUPABASE
