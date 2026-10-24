@@ -3092,14 +3092,65 @@ app.post(
         });
       }
 
-      const { statusGoogle, pago } = mapearStatusAvulsoGoogle(compraGoogle);
+      const { statusGoogle, statusInterno, pago, processando } =
+        mapearStatusAvulsoGoogle(compraGoogle);
+
+      // A compra pode ter sido cancelada/reembolsada diretamente no Google
+      // Play Console ou pela própria Play Store. Nesse caso, não tentamos
+      // reembolsá-la novamente: sincronizamos o estado local e encerramos
+      // os benefícios do plano pago. A resposta do Google é a fonte de
+      // verdade; uma compra pendente/desconhecida nunca provoca downgrade.
+      if (!pago && statusGoogle === 'CANCELLED') {
+        const atualizado = await atualizarAssinaturaGooglePorToken(
+          purchaseToken,
+          {
+            status_assinatura: 'estornado',
+            tipo_compra: 'avulso',
+            recorrente: false,
+            auto_renovacao: false,
+            cancelado_em: agoraIso,
+            updated_at: agoraIso,
+          }
+        );
+
+        const downgrade = await retornarUsuarioAoPlanoGratisGoogle({
+          usuarioId: usuario.id,
+          planoAtual: plano,
+        });
+
+        logGoogle('CANCELAR_PLANO_AVULSO_JA_CANCELADO_NO_GOOGLE', {
+          request_id: requestId,
+          usuario_id: usuario.id,
+          plano_id: planoId,
+          purchase_token: purchaseToken,
+          status_google: statusGoogle,
+        });
+
+        return res.json({
+          success: true,
+          status: 'estornado',
+          status_google: statusGoogle,
+          tipo_compra: 'avulso',
+          recorrente: false,
+          reembolso_solicitado: false,
+          compra_ja_cancelada_no_google: true,
+          acesso_pago_encerrado_imediatamente: true,
+          plano_gratis: downgrade.planoGratis,
+          compra: atualizado,
+          mensagem:
+            'O Google Play já havia cancelado esta compra. O Ache Obra sincronizou o cancelamento e ativou o plano Grátis.',
+        });
+      }
 
       if (!pago) {
-        return res.status(409).json({
+        return res.status(processando ? 202 : 409).json({
           success: false,
-          status: statusGoogle,
-          error:
-            'A compra avulsa não está em estado pago no Google e não pode ser reembolsada automaticamente.',
+          status: statusInterno || statusGoogle,
+          status_google: statusGoogle,
+          processando: Boolean(processando),
+          error: processando
+            ? 'O pagamento ainda está pendente no Google Play. O plano não pode ser cancelado como compra paga até a confirmação do estado final.'
+            : 'O Google Play não confirmou esta compra como paga nem como cancelada. O plano não foi alterado; tente sincronizar novamente.',
         });
       }
 
