@@ -396,7 +396,7 @@ async function buscarPlanoGooglePorId(planoId) {
 
       params: {
         select:
-          'id,nome_plano,google_product_id,google_product_id_avulso,google_base_plan_id,google_ativo',
+          'id,nome_plano,tipo_usuario,google_product_id,google_product_id_avulso,google_base_plan_id,google_ativo',
 
         id:
           `eq.${planoId}`,
@@ -557,6 +557,99 @@ async function atualizarPlanoAtivoUsuarioGoogle({
   });
 
   return atualizado;
+}
+
+// ============================================================
+// CANCELAMENTO IMEDIATO: RETORNAR USUÁRIO AO PLANO GRÁTIS
+// ============================================================
+function normalizarTextoPlanoGoogle(valor) {
+  return String(valor || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+async function buscarPlanoGratisGoogleDoMesmoTipo(planoAtual) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_planos`,
+    params: {
+      select: 'id,nome_plano,tipo_usuario',
+      limit: 500,
+    },
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+
+  const todosPlanos = Array.isArray(response.data) ? response.data : [];
+  const planos = todosPlanos.filter((p) =>
+    normalizarTextoPlanoGoogle(p?.nome_plano).includes('gratis')
+  );
+  if (!planos.length) {
+    throw new Error('Nenhum plano Grátis foi encontrado em tab_planos.');
+  }
+
+  const tipoAtual = normalizarTextoPlanoGoogle(planoAtual?.tipo_usuario);
+  let gratis = null;
+
+  if (tipoAtual) {
+    gratis = planos.find((p) =>
+      normalizarTextoPlanoGoogle(p?.tipo_usuario) === tipoAtual
+    ) || planos.find((p) => {
+      const tipoGratis = normalizarTextoPlanoGoogle(p?.tipo_usuario);
+      return tipoGratis && (tipoGratis.includes(tipoAtual) || tipoAtual.includes(tipoGratis));
+    });
+  }
+
+  // Se há tipos definidos no plano pago, não associamos silenciosamente
+  // um plano grátis de outro tipo de usuário.
+  if (!gratis && tipoAtual) {
+    throw new Error(`Não foi encontrado plano Grátis para o tipo de usuário "${planoAtual.tipo_usuario}".`);
+  }
+  gratis = gratis || planos[0];
+
+  if (gratis?.id == null || !String(gratis.nome_plano || '').trim()) {
+    throw new Error('O cadastro do plano Grátis não possui id/nome_plano válido.');
+  }
+  return gratis;
+}
+
+async function retornarUsuarioAoPlanoGratisGoogle({ usuarioId, planoAtual }) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const planoGratis = await buscarPlanoGratisGoogleDoMesmoTipo(planoAtual);
+  const payload = {
+    nome_plano_ativo: obterNomeBasePlano(planoGratis.nome_plano),
+    id_plano_atual: planoGratis.id,
+    plano_id: planoGratis.id,
+    recorrente: false,
+    plano_data_ativacao: null,
+  };
+
+  const response = await axios({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_usuarios`,
+    params: { id: `eq.${usuarioId}` },
+    headers: {
+      ...obterHeadersSupabase(),
+      Prefer: 'return=representation',
+    },
+    data: payload,
+    timeout: 30000,
+  });
+
+  const usuarioAtualizado = Array.isArray(response.data) ? response.data[0] : null;
+  if (!usuarioAtualizado) {
+    throw new Error('O cancelamento foi processado, mas não foi possível atualizar tab_usuarios para o plano Grátis.');
+  }
+
+  logGoogle('USUARIO_RETORNOU_AO_GRATIS_APOS_CANCELAMENTO', {
+    usuario_id: usuarioId,
+    plano_gratis_id: planoGratis.id,
+    nome_plano_gratis: planoGratis.nome_plano,
+  });
+  return { planoGratis, usuarioAtualizado };
 }
 
 async function atualizarAssinaturaGooglePorToken(
@@ -2952,6 +3045,13 @@ app.post(
           }
         );
 
+        // Regra comercial do Ache Obra: o cancelamento encerra os benefícios
+        // pagos imediatamente, mesmo que a validade original ainda não tenha acabado.
+        const downgrade = await retornarUsuarioAoPlanoGratisGoogle({
+          usuarioId: usuario.id,
+          planoAtual: plano,
+        });
+
         logGoogle('CANCELAR_PLANO_RECORRENTE_OK', {
           request_id: requestId,
           usuario_id: usuario.id,
@@ -2966,10 +3066,12 @@ app.post(
           tipo_compra: 'recorrente',
           recorrente: true,
           renovacao_cancelada: true,
+          acesso_pago_encerrado_imediatamente: true,
+          plano_gratis: downgrade.planoGratis,
           data_expiracao: expiryTime,
           assinatura: atualizado,
           mensagem:
-            'Renovação automática cancelada na Google Play com sucesso.',
+            'Renovação cancelada na Google Play. Seu acesso pago foi encerrado e o plano Grátis foi ativado imediatamente.',
         });
       }
 
@@ -3056,6 +3158,11 @@ app.post(
         }
       );
 
+      const downgrade = await retornarUsuarioAoPlanoGratisGoogle({
+        usuarioId: usuario.id,
+        planoAtual: plano,
+      });
+
       logGoogle('CANCELAR_PLANO_AVULSO_OK', {
         request_id: requestId,
         usuario_id: usuario.id,
@@ -3070,10 +3177,12 @@ app.post(
         tipo_compra: 'avulso',
         recorrente: false,
         reembolso_solicitado: true,
+        acesso_pago_encerrado_imediatamente: true,
+        plano_gratis: downgrade.planoGratis,
         google_order_id: orderId,
         compra: atualizado,
         mensagem:
-          'Reembolso da compra avulsa solicitado à Google Play com sucesso.',
+          'Reembolso solicitado à Google Play. O plano Grátis foi ativado imediatamente.',
       });
     } catch (error) {
       const statusHttp = error.response?.status || 500;
