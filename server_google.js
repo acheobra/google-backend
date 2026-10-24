@@ -3262,6 +3262,118 @@ app.post(
 );
 
 
+async function buscarUsuarioSupabasePorId(usuarioId) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_usuarios`,
+    params: {
+      select: 'id,plano_id,id_plano_atual,nome_plano_ativo,recorrente',
+      id: `eq.${usuarioId}`,
+      limit: 1,
+    },
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data[0] || null : null;
+}
+
+// ============================================================
+// GOOGLE PLAY - VERIFICAR PEDIDOS ANULADOS/REEMBOLSADOS
+// ============================================================
+// RTDN não é garantia de notificação para reembolso de produto avulso já
+// concluído. Por isso, ao consultar o status no app, também verificamos a
+// API Voided Purchases usando o purchaseToken. A API do Google é a fonte
+// de verdade para pedidos anulados/reembolsados.
+async function consultarCompraAnuladaGoogle(purchaseToken) {
+  const token = String(purchaseToken || '').trim();
+  if (!token) return null;
+
+  const packageName = obterGooglePackageName();
+  const accessToken = await obterAccessTokenGoogle();
+  const response = await axios({
+    method: 'GET',
+    url:
+      `${GOOGLE_ANDROID_PUBLISHER_BASE_URL}` +
+      `/applications/${encodeURIComponent(packageName)}` +
+      `/purchases/voidedpurchases`,
+    params: {
+      token,
+      maxResults: 100,
+    },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 30000,
+  });
+
+  const itens = Array.isArray(response.data?.voidedPurchases)
+    ? response.data.voidedPurchases
+    : [];
+  return itens.find((item) =>
+    String(item?.purchaseToken || '').trim() === token
+  ) || null;
+}
+
+async function sincronizarReembolsoGoogleSeAnulado({ usuario, registroLocal }) {
+  const purchaseToken = String(registroLocal?.purchase_token || '').trim();
+  if (!purchaseToken) return null;
+
+  const anulada = await consultarCompraAnuladaGoogle(purchaseToken);
+  if (!anulada) return null;
+
+  const agoraIso = new Date().toISOString();
+  const atualizado = await atualizarAssinaturaGooglePorToken(purchaseToken, {
+    status_assinatura: 'estornado',
+    auto_renovacao: false,
+    cancelado_em: agoraIso,
+    updated_at: agoraIso,
+  });
+
+  // Só altera o plano se a assinatura anulada for a que está ativa no perfil.
+  // Evita um reembolso de uma compra antiga derrubar uma compra mais recente.
+  const usuarioAtual = await buscarUsuarioSupabasePorId(usuario.id);
+  const planoAtivoId = String(
+    usuarioAtual?.plano_id || usuarioAtual?.id_plano_atual || ''
+  );
+  const planoCompraId = String(registroLocal?.plano_id || '');
+  let downgrade = null;
+
+  if (planoAtivoId && planoCompraId && planoAtivoId === planoCompraId) {
+    const planoAtual = await buscarPlanoGooglePorId(planoCompraId);
+    if (planoAtual) {
+      downgrade = await retornarUsuarioAoPlanoGratisGoogle({
+        usuarioId: usuario.id,
+        planoAtual,
+      });
+    }
+  }
+
+  logGoogle('COMPRA_GOOGLE_ANULADA_SINCRONIZADA', {
+    usuario_id: usuario.id,
+    plano_id: registroLocal?.plano_id || null,
+    order_id: anulada?.orderId || registroLocal?.google_order_id || null,
+    product_type: anulada?.productType || null,
+    refund_type: anulada?.refundType || null,
+    plano_gratis_ativado: Boolean(downgrade),
+  });
+
+  return {
+    anulada: true,
+    status: 'estornado',
+    local: atualizado || registroLocal,
+    plano_gratis_ativado: Boolean(downgrade),
+    plano_gratis: downgrade?.planoGratis || null,
+    pedido_anulado: {
+      orderId: anulada?.orderId || null,
+      productType: anulada?.productType || null,
+      refundType: anulada?.refundType || null,
+      voidedTimeMillis: anulada?.voidedTimeMillis || null,
+    },
+  };
+}
+
 // ============================================================
 // GOOGLE - CONSULTAR STATUS JÁ REGISTRADO
 // ============================================================
@@ -3333,20 +3445,38 @@ app.get(
           });
       }
 
+      // Antes de retornar o estado da compra, reconcilia reembolsos/anulações
+      // registrados pelo Google. Isso cobre o caso em que o plano avulso foi
+      // reembolsado no Play Console e o Pub/Sub não entregou um evento útil.
+      const sincronizacaoAnulacao =
+        await sincronizarReembolsoGoogleSeAnulado({
+          usuario,
+          registroLocal,
+        });
+
+      if (sincronizacaoAnulacao?.anulada) {
+        return res.json({
+          success: true,
+          local: sincronizacaoAnulacao.local,
+          google: null,
+          sincronizado: true,
+          status: 'estornado',
+          plano_gratis_ativado: sincronizacaoAnulacao.plano_gratis_ativado,
+          plano_gratis: sincronizacaoAnulacao.plano_gratis,
+          pedido_anulado: sincronizacaoAnulacao.pedido_anulado,
+        });
+      }
+
       const assinaturaGoogle =
-        await consultarAssinaturaGoogle(
-          purchaseToken
-        );
+        registroLocal.tipo_compra === 'recorrente' || registroLocal.recorrente
+          ? await consultarAssinaturaGoogle(purchaseToken)
+          : await consultarProdutoAvulsoGoogle(purchaseToken);
 
       return res.json({
-        success:
-          true,
-
-        local:
-          registroLocal,
-
-        google:
-          assinaturaGoogle,
+        success: true,
+        local: registroLocal,
+        google: assinaturaGoogle,
+        sincronizado: false,
       });
 
     } catch (error) {
