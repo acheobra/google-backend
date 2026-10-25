@@ -3506,13 +3506,39 @@ app.get(
 
       if (ehRecorrente) {
         statusGoogle = String(compraGoogle?.subscriptionState || '').trim().toUpperCase();
+
+        // No Google Play, cancelar a renovação nem sempre muda imediatamente
+        // subscriptionState para SUBSCRIPTION_STATE_CANCELED. A assinatura
+        // pode continuar como ACTIVE até o fim do período, mas
+        // autoRenewEnabled já estará false. Como o Ache Obra aplica a regra
+        // de encerramento imediato solicitada pelo produto, também tratamos
+        // esse sinal como cancelamento e sincronizamos o plano local.
+        const lineItemsGoogle = Array.isArray(compraGoogle?.lineItems)
+          ? compraGoogle.lineItems
+          : [];
+        const renovacaoDesativada = lineItemsGoogle.some((item) =>
+          item?.autoRenewingPlan?.autoRenewEnabled === false
+        );
+
         compraEncerrada = [
           'SUBSCRIPTION_STATE_CANCELED',
           'SUBSCRIPTION_STATE_EXPIRED',
-        ].includes(statusGoogle);
+        ].includes(statusGoogle) ||
+          (statusGoogle === 'SUBSCRIPTION_STATE_ACTIVE' && renovacaoDesativada);
+
         statusFinal = statusGoogle === 'SUBSCRIPTION_STATE_EXPIRED'
           ? 'expirado'
           : 'cancelado';
+
+        if (renovacaoDesativada && statusGoogle === 'SUBSCRIPTION_STATE_ACTIVE') {
+          logGoogle('GOOGLE_RENOVACAO_DESATIVADA_DETECTADA', {
+            usuario_id: usuario.id,
+            purchase_token: mascararToken(purchaseToken),
+            subscription_state: statusGoogle,
+            auto_renovacao: false,
+            acao: 'sincronizar_cancelamento_no_app',
+          });
+        }
       } else {
         const estadoCompra = String(
           compraGoogle?.purchaseStateContext?.purchaseState || ''
