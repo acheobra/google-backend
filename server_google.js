@@ -3375,6 +3375,141 @@ async function sincronizarReembolsoGoogleSeAnulado({ usuario, registroLocal }) {
 }
 
 // ============================================================
+// GOOGLE PLAY - RTDN (REAL-TIME DEVELOPER NOTIFICATIONS) VIA PUB/SUB PUSH
+// ============================================================
+// Configure a assinatura Pub/Sub como PUSH para:
+// https://SEU-SERVICO-RENDER/google/rtdn
+// Configure autenticação OIDC na assinatura Pub/Sub e restrinja a chamada
+// a este endpoint. Uma assinatura do tipo PULL não chama este backend.
+// O endpoint confirma o recebimento; para reembolsos de produtos avulsos,
+// consulta a API Voided Purchases do Google antes de remover o plano.
+// ============================================================
+
+app.post('/google/rtdn', async (req, res) => {
+  const requestId = req.googleRequestId || null;
+
+  try {
+    const envelope = req.body || {};
+    const message = envelope.message || null;
+
+    if (!message || typeof message.data !== 'string') {
+      logGoogle('RTDN_PAYLOAD_INVALIDO', {
+        request_id: requestId,
+        possui_message: Boolean(message),
+      });
+      return res.status(400).json({ success: false, error: 'Envelope Pub/Sub inválido.' });
+    }
+
+    let notification;
+    try {
+      notification = JSON.parse(Buffer.from(message.data, 'base64').toString('utf8'));
+    } catch (error) {
+      logGoogle('RTDN_JSON_INVALIDO', { request_id: requestId, erro: error.message });
+      return res.status(400).json({ success: false, error: 'O conteúdo da mensagem Pub/Sub não é JSON válido.' });
+    }
+
+    if (notification.testNotification) {
+      logGoogle('RTDN_TESTE_RECEBIDO', {
+        request_id: requestId,
+        package_name: notification.packageName || null,
+        versao: notification.testNotification.version || null,
+      });
+      return res.status(200).json({ success: true, test_notification: true, acknowledged: true });
+    }
+
+    const packageName = String(notification.packageName || '').trim();
+    if (packageName && packageName !== obterGooglePackageName()) {
+      logGoogle('RTDN_PACKAGE_DIVERGENTE', {
+        request_id: requestId,
+        package_recebido: packageName,
+        package_configurado: obterGooglePackageName(),
+      });
+      return res.status(200).json({ success: true, ignorada: true, motivo: 'packageName divergente' });
+    }
+
+    const oneTime = notification.oneTimeProductNotification || null;
+    const subscription = notification.subscriptionNotification || null;
+    const voided = notification.voidedPurchaseNotification || null;
+    const purchaseToken = String(
+      oneTime?.purchaseToken || subscription?.purchaseToken || voided?.purchaseToken || ''
+    ).trim();
+
+    logGoogle('RTDN_NOTIFICACAO_RECEBIDA', {
+      request_id: requestId,
+      package_name: packageName || null,
+      event_time_millis: notification.eventTimeMillis || null,
+      tipo: oneTime ? 'produto_avulso' : subscription ? 'assinatura' : voided ? 'compra_anulada' : 'desconhecido',
+      notification_type: oneTime?.notificationType ?? subscription?.notificationType ?? voided?.notificationType ?? null,
+      sku: oneTime?.sku || subscription?.subscriptionId || null,
+      purchase_token: purchaseToken || null,
+      message_id: message.messageId || null,
+    });
+
+    if (!purchaseToken) {
+      // Eventos sem token (por exemplo, notificações de teste já tratadas)
+      // não podem ser correlacionados com um usuário.
+      return res.status(200).json({ success: true, ignorada: true, motivo: 'notificação sem purchaseToken' });
+    }
+
+    const registroLocal = await buscarAssinaturaGooglePorToken(purchaseToken);
+    if (!registroLocal) {
+      logGoogle('RTDN_COMPRA_LOCAL_NAO_ENCONTRADA', {
+        request_id: requestId,
+        purchase_token: purchaseToken,
+        sku: oneTime?.sku || subscription?.subscriptionId || null,
+      });
+      // ACK para evitar loop infinito. A compra pode ainda não ter sido
+      // persistida no banco quando o evento chegar; o app pode reconciliar
+      // depois por /google/status/:purchaseToken.
+      return res.status(200).json({ success: true, sincronizada: false, motivo: 'compra ainda não encontrada no banco' });
+    }
+
+    // A notificação RTDN não é, por si só, prova de reembolso. Consultamos
+    // a lista oficial de compras anuladas e só então mudamos o plano local.
+    const resultado = await sincronizarReembolsoGoogleSeAnulado({
+      usuario: { id: registroLocal.usuario_id },
+      registroLocal,
+    });
+
+    if (resultado?.anulada) {
+      logGoogle('RTDN_REEMBOLSO_SINCRONIZADO', {
+        request_id: requestId,
+        usuario_id: registroLocal.usuario_id,
+        plano_id: registroLocal.plano_id || null,
+        plano_gratis_ativado: resultado.plano_gratis_ativado,
+      });
+      return res.status(200).json({
+        success: true,
+        sincronizada: true,
+        status: 'estornado',
+        plano_gratis_ativado: resultado.plano_gratis_ativado,
+      });
+    }
+
+    // Uma notificação de compra avulsa pode chegar antes do reembolso ou
+    // representar apenas a compra original; não removemos acesso sem prova
+    // de anulação na API oficial do Google.
+    logGoogle('RTDN_SEM_ANULACAO_CONFIRMADA', {
+      request_id: requestId,
+      usuario_id: registroLocal.usuario_id,
+      tipo_compra: registroLocal.tipo_compra || null,
+      purchase_token: purchaseToken,
+    });
+
+    return res.status(200).json({ success: true, sincronizada: false, motivo: 'Google ainda não confirmou anulação/reembolso' });
+  } catch (error) {
+    logGoogle('RTDN_ERRO', {
+      request_id: requestId,
+      http_status: error.response?.status || 500,
+      erro: error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Erro desconhecido',
+    });
+    // 500 faz o Pub/Sub tentar entregar novamente quando a falha for
+    // transitória, em vez de marcar a mensagem como processada.
+    return res.status(500).json({ success: false, error: 'Falha ao processar notificação Google Play.' });
+  }
+});
+
+// ============================================================
 // GOOGLE - CONSULTAR STATUS JÁ REGISTRADO
 // ============================================================
 //
