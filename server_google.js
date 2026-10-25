@@ -3286,34 +3286,55 @@ async function buscarUsuarioSupabasePorId(usuarioId) {
 // API Voided Purchases usando o purchaseToken. A API do Google é a fonte
 // de verdade para pedidos anulados/reembolsados.
 async function consultarCompraAnuladaGoogle(purchaseToken) {
-  const token = String(purchaseToken || '').trim();
-  if (!token) return null;
+  const purchaseTokenAlvo = String(purchaseToken || '').trim();
+  if (!purchaseTokenAlvo) return null;
 
   const packageName = obterGooglePackageName();
   const accessToken = await obterAccessTokenGoogle();
-  const response = await axios({
-    method: 'GET',
-    url:
-      `${GOOGLE_ANDROID_PUBLISHER_BASE_URL}` +
-      `/applications/${encodeURIComponent(packageName)}` +
-      `/purchases/voidedpurchases`,
-    params: {
-      token,
-      maxResults: 100,
-    },
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 30000,
-  });
+  let tokenPaginacao = null;
+  const maxPaginas = 10;
 
-  const itens = Array.isArray(response.data?.voidedPurchases)
-    ? response.data.voidedPurchases
-    : [];
-  return itens.find((item) =>
-    String(item?.purchaseToken || '').trim() === token
-  ) || null;
+  // IMPORTANTE:
+  // O parâmetro "token" da API voidedpurchases é um TOKEN DE PAGINAÇÃO,
+  // não o purchaseToken da compra. Enviar o purchaseToken aqui causa HTTP 400
+  // com "Invalid pagination token" e impede a sincronização do cancelamento.
+  for (let pagina = 0; pagina < maxPaginas; pagina += 1) {
+    const params = { maxResults: 1000 };
+    if (tokenPaginacao) params.token = tokenPaginacao;
+
+    const response = await axios({
+      method: 'GET',
+      url:
+        `${GOOGLE_ANDROID_PUBLISHER_BASE_URL}` +
+        `/applications/${encodeURIComponent(packageName)}` +
+        `/purchases/voidedpurchases`,
+      params,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 30000,
+    });
+
+    const itens = Array.isArray(response.data?.voidedPurchases)
+      ? response.data.voidedPurchases
+      : [];
+
+    const compraAnulada = itens.find((item) =>
+      String(item?.purchaseToken || '').trim() === purchaseTokenAlvo
+    );
+    if (compraAnulada) return compraAnulada;
+
+    // A API devolve o próximo token dentro de tokenPagination. Só esse valor
+    // pode ser enviado no parâmetro "token" da próxima página.
+    const proximoToken = String(
+      response.data?.tokenPagination?.nextPageToken || ''
+    ).trim();
+    if (!proximoToken || proximoToken === tokenPaginacao) break;
+    tokenPaginacao = proximoToken;
+  }
+
+  return null;
 }
 
 async function sincronizarReembolsoGoogleSeAnulado({ usuario, registroLocal }) {
