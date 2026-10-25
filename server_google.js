@@ -3375,141 +3375,6 @@ async function sincronizarReembolsoGoogleSeAnulado({ usuario, registroLocal }) {
 }
 
 // ============================================================
-// GOOGLE PLAY - RTDN (REAL-TIME DEVELOPER NOTIFICATIONS) VIA PUB/SUB PUSH
-// ============================================================
-// Configure a assinatura Pub/Sub como PUSH para:
-// https://SEU-SERVICO-RENDER/google/rtdn
-// Configure autenticação OIDC na assinatura Pub/Sub e restrinja a chamada
-// a este endpoint. Uma assinatura do tipo PULL não chama este backend.
-// O endpoint confirma o recebimento; para reembolsos de produtos avulsos,
-// consulta a API Voided Purchases do Google antes de remover o plano.
-// ============================================================
-
-app.post('/google/rtdn', async (req, res) => {
-  const requestId = req.googleRequestId || null;
-
-  try {
-    const envelope = req.body || {};
-    const message = envelope.message || null;
-
-    if (!message || typeof message.data !== 'string') {
-      logGoogle('RTDN_PAYLOAD_INVALIDO', {
-        request_id: requestId,
-        possui_message: Boolean(message),
-      });
-      return res.status(400).json({ success: false, error: 'Envelope Pub/Sub inválido.' });
-    }
-
-    let notification;
-    try {
-      notification = JSON.parse(Buffer.from(message.data, 'base64').toString('utf8'));
-    } catch (error) {
-      logGoogle('RTDN_JSON_INVALIDO', { request_id: requestId, erro: error.message });
-      return res.status(400).json({ success: false, error: 'O conteúdo da mensagem Pub/Sub não é JSON válido.' });
-    }
-
-    if (notification.testNotification) {
-      logGoogle('RTDN_TESTE_RECEBIDO', {
-        request_id: requestId,
-        package_name: notification.packageName || null,
-        versao: notification.testNotification.version || null,
-      });
-      return res.status(200).json({ success: true, test_notification: true, acknowledged: true });
-    }
-
-    const packageName = String(notification.packageName || '').trim();
-    if (packageName && packageName !== obterGooglePackageName()) {
-      logGoogle('RTDN_PACKAGE_DIVERGENTE', {
-        request_id: requestId,
-        package_recebido: packageName,
-        package_configurado: obterGooglePackageName(),
-      });
-      return res.status(200).json({ success: true, ignorada: true, motivo: 'packageName divergente' });
-    }
-
-    const oneTime = notification.oneTimeProductNotification || null;
-    const subscription = notification.subscriptionNotification || null;
-    const voided = notification.voidedPurchaseNotification || null;
-    const purchaseToken = String(
-      oneTime?.purchaseToken || subscription?.purchaseToken || voided?.purchaseToken || ''
-    ).trim();
-
-    logGoogle('RTDN_NOTIFICACAO_RECEBIDA', {
-      request_id: requestId,
-      package_name: packageName || null,
-      event_time_millis: notification.eventTimeMillis || null,
-      tipo: oneTime ? 'produto_avulso' : subscription ? 'assinatura' : voided ? 'compra_anulada' : 'desconhecido',
-      notification_type: oneTime?.notificationType ?? subscription?.notificationType ?? voided?.notificationType ?? null,
-      sku: oneTime?.sku || subscription?.subscriptionId || null,
-      purchase_token: purchaseToken || null,
-      message_id: message.messageId || null,
-    });
-
-    if (!purchaseToken) {
-      // Eventos sem token (por exemplo, notificações de teste já tratadas)
-      // não podem ser correlacionados com um usuário.
-      return res.status(200).json({ success: true, ignorada: true, motivo: 'notificação sem purchaseToken' });
-    }
-
-    const registroLocal = await buscarAssinaturaGooglePorToken(purchaseToken);
-    if (!registroLocal) {
-      logGoogle('RTDN_COMPRA_LOCAL_NAO_ENCONTRADA', {
-        request_id: requestId,
-        purchase_token: purchaseToken,
-        sku: oneTime?.sku || subscription?.subscriptionId || null,
-      });
-      // ACK para evitar loop infinito. A compra pode ainda não ter sido
-      // persistida no banco quando o evento chegar; o app pode reconciliar
-      // depois por /google/status/:purchaseToken.
-      return res.status(200).json({ success: true, sincronizada: false, motivo: 'compra ainda não encontrada no banco' });
-    }
-
-    // A notificação RTDN não é, por si só, prova de reembolso. Consultamos
-    // a lista oficial de compras anuladas e só então mudamos o plano local.
-    const resultado = await sincronizarReembolsoGoogleSeAnulado({
-      usuario: { id: registroLocal.usuario_id },
-      registroLocal,
-    });
-
-    if (resultado?.anulada) {
-      logGoogle('RTDN_REEMBOLSO_SINCRONIZADO', {
-        request_id: requestId,
-        usuario_id: registroLocal.usuario_id,
-        plano_id: registroLocal.plano_id || null,
-        plano_gratis_ativado: resultado.plano_gratis_ativado,
-      });
-      return res.status(200).json({
-        success: true,
-        sincronizada: true,
-        status: 'estornado',
-        plano_gratis_ativado: resultado.plano_gratis_ativado,
-      });
-    }
-
-    // Uma notificação de compra avulsa pode chegar antes do reembolso ou
-    // representar apenas a compra original; não removemos acesso sem prova
-    // de anulação na API oficial do Google.
-    logGoogle('RTDN_SEM_ANULACAO_CONFIRMADA', {
-      request_id: requestId,
-      usuario_id: registroLocal.usuario_id,
-      tipo_compra: registroLocal.tipo_compra || null,
-      purchase_token: purchaseToken,
-    });
-
-    return res.status(200).json({ success: true, sincronizada: false, motivo: 'Google ainda não confirmou anulação/reembolso' });
-  } catch (error) {
-    logGoogle('RTDN_ERRO', {
-      request_id: requestId,
-      http_status: error.response?.status || 500,
-      erro: error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Erro desconhecido',
-    });
-    // 500 faz o Pub/Sub tentar entregar novamente quando a falha for
-    // transitória, em vez de marcar a mensagem como processada.
-    return res.status(500).json({ success: false, error: 'Falha ao processar notificação Google Play.' });
-  }
-});
-
-// ============================================================
 // GOOGLE - CONSULTAR STATUS JÁ REGISTRADO
 // ============================================================
 //
@@ -3602,16 +3467,95 @@ app.get(
         });
       }
 
-      const assinaturaGoogle =
-        registroLocal.tipo_compra === 'recorrente' || registroLocal.recorrente
-          ? await consultarAssinaturaGoogle(purchaseToken)
-          : await consultarProdutoAvulsoGoogle(purchaseToken);
+      const ehRecorrente =
+        String(registroLocal.tipo_compra || '').toLowerCase() === 'recorrente' ||
+        registroLocal.recorrente === true;
+
+      const compraGoogle = ehRecorrente
+        ? await consultarAssinaturaGoogle(purchaseToken)
+        : await consultarProdutoAvulsoGoogle(purchaseToken);
+
+      // Reconciliação ativa: não dependemos exclusivamente do Pub/Sub RTDN.
+      // Se o Google confirmar que a assinatura foi cancelada/expirada, ou que
+      // a compra avulsa foi cancelada, atualizamos o registro local e só
+      // retiramos o plano se esta compra ainda for o plano atual do usuário.
+      let statusGoogle = '';
+      let compraEncerrada = false;
+      let statusFinal = '';
+
+      if (ehRecorrente) {
+        statusGoogle = String(compraGoogle?.subscriptionState || '').trim().toUpperCase();
+        compraEncerrada = [
+          'SUBSCRIPTION_STATE_CANCELED',
+          'SUBSCRIPTION_STATE_EXPIRED',
+        ].includes(statusGoogle);
+        statusFinal = statusGoogle === 'SUBSCRIPTION_STATE_EXPIRED'
+          ? 'expirado'
+          : 'cancelado';
+      } else {
+        const estadoCompra = String(
+          compraGoogle?.purchaseStateContext?.purchaseState || ''
+        ).trim().toUpperCase();
+        statusGoogle = estadoCompra;
+        compraEncerrada = estadoCompra === 'CANCELLED';
+        statusFinal = 'estornado';
+      }
+
+      if (compraEncerrada) {
+        const agora = new Date().toISOString();
+        const localAtualizado = await atualizarAssinaturaGooglePorToken(
+          purchaseToken,
+          {
+            status_assinatura: statusFinal,
+            auto_renovacao: false,
+            recorrente: false,
+            cancelado_em: agora,
+            updated_at: agora,
+          }
+        );
+
+        const usuarioAtual = await buscarUsuarioGooglePorId(usuario.id);
+        const planoAtualId = String(
+          usuarioAtual?.plano_id || usuarioAtual?.id_plano_atual || ''
+        );
+        const planoCompraId = String(registroLocal.plano_id || '');
+        let downgrade = null;
+
+        if (planoAtualId && planoCompraId && planoAtualId === planoCompraId) {
+          const planoAtual = await buscarPlanoGooglePorId(planoCompraId);
+          if (planoAtual) {
+            downgrade = await retornarUsuarioAoPlanoGratisGoogle({
+              usuarioId: usuario.id,
+              planoAtual,
+            });
+          }
+        }
+
+        logGoogle('STATUS_GOOGLE_CANCELAMENTO_SINCRONIZADO', {
+          usuario_id: usuario.id,
+          plano_id: planoCompraId,
+          tipo_compra: ehRecorrente ? 'recorrente' : 'avulso',
+          status_google: statusGoogle,
+          plano_gratis_ativado: Boolean(downgrade),
+        });
+
+        return res.json({
+          success: true,
+          local: localAtualizado || registroLocal,
+          google: compraGoogle,
+          sincronizado: true,
+          status: statusFinal,
+          plano_gratis_ativado: Boolean(downgrade),
+          plano_gratis: downgrade?.planoGratis || null,
+        });
+      }
 
       return res.json({
         success: true,
         local: registroLocal,
-        google: assinaturaGoogle,
+        google: compraGoogle,
         sincronizado: false,
+        status_google: statusGoogle || null,
       });
 
     } catch (error) {
@@ -3637,6 +3581,172 @@ app.get(
     }
   }
 );
+
+// ============================================================
+// GOOGLE PLAY RTDN (PUB/SUB PUSH) - SINCRONIZA CANCELAMENTOS
+// ============================================================
+// Configure a assinatura Pub/Sub do tipo PUSH para chamar:
+// https://SEU-SERVICO.onrender.com/google/pubsub/rtdn?token=GOOGLE_PUBSUB_PUSH_TOKEN
+// Defina GOOGLE_PUBSUB_PUSH_TOKEN no Render com o mesmo segredo.
+// A mensagem RTDN é apenas um aviso: o token é correlacionado com o registro
+// local e a mudança de acesso é feita no Supabase no servidor.
+
+async function buscarUsuarioGooglePorId(usuarioId) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_usuarios`,
+    params: {
+      select: 'id,plano_id,id_plano_atual,nome_plano_ativo,recorrente',
+      id: `eq.${usuarioId}`,
+      limit: 1,
+    },
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data[0] || null : null;
+}
+
+async function processarRtdnGooglePlay(payload) {
+  const mensagem = payload?.message;
+  if (!mensagem?.data) throw new Error('Mensagem Pub/Sub sem message.data.');
+
+  let evento;
+  try {
+    evento = JSON.parse(Buffer.from(mensagem.data, 'base64').toString('utf8'));
+  } catch (_) {
+    throw new Error('O conteúdo message.data não é um JSON RTDN válido.');
+  }
+
+  const pacote = String(evento.packageName || '').trim();
+  const pacoteEsperado = obterGooglePackageName();
+  if (pacote && pacote !== pacoteEsperado) {
+    logGoogle('RTDN_PACOTE_IGNORADO', { package_name: pacote });
+    return { ignorado: true, motivo: 'packageName diferente' };
+  }
+
+  const oneTime = evento.oneTimeProductNotification;
+  const subscription = evento.subscriptionNotification;
+  const token = String(oneTime?.purchaseToken || subscription?.purchaseToken || '').trim();
+  if (!token) {
+    // Test notifications não carregam purchaseToken; responder 200 evita retries inúteis.
+    if (evento.testNotification) {
+      logGoogle('RTDN_TESTE_RECEBIDO', { package_name: pacote || pacoteEsperado });
+      return { teste: true };
+    }
+    logGoogle('RTDN_SEM_PURCHASE_TOKEN', { package_name: pacote || pacoteEsperado });
+    return { ignorado: true, motivo: 'evento sem purchaseToken' };
+  }
+
+  const registro = await buscarAssinaturaGooglePorToken(token);
+  if (!registro) {
+    logGoogle('RTDN_TOKEN_NAO_ENCONTRADO', {
+      purchase_token: token,
+      sku: oneTime?.sku || null,
+      notification_type: oneTime?.notificationType ?? subscription?.notificationType ?? null,
+    });
+    // 200: não ficar repetindo indefinidamente. A sincronização manual pode resolver
+    // eventos recebidos antes de o registro local ser criado.
+    return { ignorado: true, motivo: 'purchaseToken sem registro local' };
+  }
+
+  const tipo = String(registro.tipo_compra || (subscription ? 'recorrente' : 'avulso')).toLowerCase();
+  const tipoNotificacaoAvulsa = Number(oneTime?.notificationType);
+  const tipoNotificacaoAssinatura = Number(subscription?.notificationType);
+
+  // ONE_TIME_PRODUCT_CANCELED = 2 (inclui cancelamento/revogação após reembolso).
+  // SUBSCRIPTION_CANCELED = 3; REVOKED = 12; EXPIRED = 13.
+  const cancelarAvulso = Boolean(oneTime && tipoNotificacaoAvulsa === 2);
+  const cancelarRecorrente = Boolean(subscription && [3, 12, 13].includes(tipoNotificacaoAssinatura));
+
+  if (!cancelarAvulso && !cancelarRecorrente) {
+    logGoogle('RTDN_EVENTO_INFORMATIVO', {
+      usuario_id: registro.usuario_id,
+      tipo_compra: tipo,
+      one_time_notification_type: oneTime?.notificationType ?? null,
+      subscription_notification_type: subscription?.notificationType ?? null,
+    });
+    return { processado: true, alterou_acesso: false, motivo: 'evento não revoga acesso' };
+  }
+
+  const agora = new Date().toISOString();
+  const statusFinal = cancelarAvulso ? 'estornado' : 'cancelado';
+  await atualizarAssinaturaGooglePorToken(token, {
+    status_assinatura: statusFinal,
+    tipo_compra: tipo,
+    recorrente: false,
+    auto_renovacao: false,
+    cancelado_em: agora,
+    updated_at: agora,
+  });
+
+  const usuarioId = registro.usuario_id;
+  const planoIdRegistro = registro.plano_id;
+  if (!usuarioId || !planoIdRegistro) {
+    logGoogle('RTDN_REGISTRO_INCOMPLETO', {
+      purchase_token: token,
+      tem_usuario_id: Boolean(usuarioId),
+      tem_plano_id: Boolean(planoIdRegistro),
+    });
+    return { processado: true, registro_atualizado: true, alterou_acesso: false, motivo: 'registro sem usuario_id/plano_id' };
+  }
+
+  const usuario = await buscarUsuarioGooglePorId(usuarioId);
+  if (!usuario) {
+    logGoogle('RTDN_USUARIO_NAO_ENCONTRADO', { usuario_id: usuarioId, plano_id: planoIdRegistro });
+    return { processado: true, registro_atualizado: true, alterou_acesso: false, motivo: 'usuário não encontrado' };
+  }
+
+  // Proteção: um evento atrasado de uma compra antiga não pode retirar um plano
+  // mais novo que o usuário já comprou.
+  const planoAtualId = String(usuario.plano_id || usuario.id_plano_atual || '');
+  if (planoAtualId !== String(planoIdRegistro)) {
+    logGoogle('RTDN_ACESSO_PRESERVADO_PLANO_DIFERENTE', {
+      usuario_id: usuarioId,
+      plano_do_evento: planoIdRegistro,
+      plano_atual: planoAtualId || null,
+      status_final: statusFinal,
+    });
+    return { processado: true, registro_atualizado: true, alterou_acesso: false, motivo: 'usuário já está em outro plano' };
+  }
+
+  const planoAtual = await buscarPlanoGooglePorId(planoIdRegistro);
+  if (!planoAtual) throw new Error(`Plano ${planoIdRegistro} não encontrado em tab_planos.`);
+  const downgrade = await retornarUsuarioAoPlanoGratisGoogle({ usuarioId, planoAtual });
+
+  logGoogle('RTDN_ACESSO_REVOGADO', {
+    usuario_id: usuarioId,
+    plano_cancelado_id: planoIdRegistro,
+    plano_gratis_id: downgrade.planoGratis.id,
+    tipo_compra: tipo,
+    status_final: statusFinal,
+    one_time_notification_type: oneTime?.notificationType ?? null,
+    subscription_notification_type: subscription?.notificationType ?? null,
+  });
+
+  return { processado: true, alterou_acesso: true, status: statusFinal, plano_gratis_id: downgrade.planoGratis.id };
+}
+
+app.post('/google/pubsub/rtdn', async (req, res) => {
+  const segredoConfigurado = String(process.env.GOOGLE_PUBSUB_PUSH_TOKEN || '').trim();
+  const segredoRecebido = String(req.query.token || '').trim();
+  if (!segredoConfigurado || !segredoRecebido || segredoRecebido !== segredoConfigurado) {
+    logGoogle('RTDN_ACESSO_NEGADO', { segredo_configurado: Boolean(segredoConfigurado) });
+    return res.status(401).json({ success: false, error: 'Push Pub/Sub não autorizado.' });
+  }
+
+  try {
+    const resultado = await processarRtdnGooglePlay(req.body || {});
+    return res.status(200).json({ success: true, ...resultado });
+  } catch (error) {
+    logGoogle('RTDN_PROCESSAMENTO_ERRO', {
+      erro: error.response?.data?.message || error.message || 'Erro desconhecido',
+      http_status: error.response?.status || null,
+    });
+    // 500 faz Pub/Sub tentar novamente se houver falha temporária no Supabase.
+    return res.status(500).json({ success: false, error: 'Falha ao processar notificação Google Play.' });
+  }
+});
 
 // ============================================================
 // INICIAR SERVIDOR
