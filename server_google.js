@@ -84,7 +84,7 @@ app.use((req, res, next) => {
 
   res.header(
     'Access-Control-Allow-Headers',
-    'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-diagnostic-key'
   );
 
   res.header(
@@ -859,7 +859,16 @@ async function atualizarPagamentoSeloGooglePorToken(purchaseToken, dados) {
     data: { ...dados, updated_at: new Date().toISOString() },
     timeout: 30000,
   });
-  return Array.isArray(response.data) ? response.data[0] || null : null;
+  const atualizado = Array.isArray(response.data) ? response.data[0] || null : null;
+  if (!atualizado) {
+    throw new Error('Nenhum pagamento foi atualizado em tab_pagamentos_selo_google para este purchase_token.');
+  }
+  logGoogle('SELO_PAGAMENTO_PATCH_CONFIRMADO', {
+    usuario_id: atualizado.usuario_id || null,
+    selo_id: atualizado.selo_id || null,
+    status_pagamento: atualizado.status_pagamento || null,
+  });
+  return atualizado;
 }
 
 async function revogarSeloVerificacaoGoogle(usuarioId, motivo) {
@@ -877,7 +886,12 @@ async function revogarSeloVerificacaoGoogle(usuarioId, motivo) {
     },
     timeout: 30000,
   });
-  return Array.isArray(response.data) ? response.data.length : 0;
+  const quantidade = Array.isArray(response.data) ? response.data.length : 0;
+  if (quantidade === 0) {
+    throw new Error(`Nenhum registro em tab_selo_verificacao foi atualizado para usuario_id ${usuarioId}. Verifique se existe registro para esse usuário e se os nomes das colunas estão corretos.`);
+  }
+  logGoogle('SELO_VERIFICACAO_REVOGADO', { usuario_id: usuarioId, registros_atualizados: quantidade, status: 'rejeitado' });
+  return quantidade;
 }
 
 async function processarEstornoSeloGoogle(purchaseToken, registroSelo, eventoGoogle = null) {
@@ -3886,6 +3900,74 @@ app.post('/google/pubsub/rtdn', async (req, res) => {
     });
     // 500 faz Pub/Sub tentar novamente se houver falha temporária no Supabase.
     return res.status(500).json({ success: false, error: 'Falha ao processar notificação Google Play.' });
+  }
+});
+
+// ============================================================
+// DIAGNÓSTICO / RECONCILIAÇÃO MANUAL DE ESTORNO DO SELO
+// ============================================================
+// Endpoint protegido pela GOOGLE_DIAGNOSTIC_KEY já usada nas rotas técnicas.
+// Não marca estorno por solicitação do cliente: só atualiza se a API oficial
+// Voided Purchases do Google confirmar que o purchaseToken foi anulado.
+// POST /google/diagnostico/selo-estorno
+// Header: x-diagnostic-key: <GOOGLE_DIAGNOSTIC_KEY>
+// Body JSON: { "purchase_token": "..." }
+app.post('/google/diagnostico/selo-estorno', protegerDiagnostico, async (req, res) => {
+  const purchaseToken = String(req.body?.purchase_token || '').trim();
+  if (!purchaseToken) {
+    return res.status(400).json({ success: false, error: 'Informe purchase_token no corpo JSON.' });
+  }
+
+  try {
+    logGoogle('SELO_ESTORNO_DIAGNOSTICO_INICIO', { purchase_token: purchaseToken });
+    const pagamento = await buscarPagamentoSeloPorToken(purchaseToken);
+    if (!pagamento) {
+      return res.status(404).json({ success: false, confirmado_pelo_google: false, error: 'Nenhum pagamento de selo encontrado para esse purchase_token.' });
+    }
+
+    const anulada = await consultarCompraAnuladaGoogle(purchaseToken);
+    if (!anulada) {
+      logGoogle('SELO_ESTORNO_DIAGNOSTICO_NAO_CONFIRMADO', {
+        usuario_id: pagamento.usuario_id,
+        selo_id: pagamento.selo_id,
+        status_pagamento_local: pagamento.status_pagamento,
+      });
+      return res.status(200).json({
+        success: true,
+        confirmado_pelo_google: false,
+        atualizado: false,
+        status_pagamento_atual: pagamento.status_pagamento,
+        message: 'A API Voided Purchases não retornou anulação para esse token. Nenhum dado foi alterado.',
+      });
+    }
+
+    const resultado = await processarEstornoSeloGoogle(purchaseToken, pagamento, anulada);
+    const pagamentoAtualizado = await buscarPagamentoSeloPorToken(purchaseToken);
+    return res.json({
+      success: true,
+      confirmado_pelo_google: true,
+      atualizado: true,
+      status_pagamento: pagamentoAtualizado?.status_pagamento || null,
+      selo_revogado: resultado.selos_atualizados > 0,
+      resultado,
+      pedido_anulado: {
+        orderId: anulada.orderId || null,
+        productType: anulada.productType || null,
+        refundType: anulada.refundType || null,
+        voidedTimeMillis: anulada.voidedTimeMillis || null,
+      },
+    });
+  } catch (error) {
+    logGoogle('SELO_ESTORNO_DIAGNOSTICO_ERRO', {
+      purchase_token: purchaseToken,
+      http_status: error.response?.status || null,
+      erro: error.response?.data?.error?.message || error.response?.data?.message || error.message,
+    });
+    return res.status(500).json({
+      success: false,
+      error: 'Falha ao reconciliar o estorno do selo. Consulte os logs do backend.',
+      http_status_google_ou_supabase: error.response?.status || null,
+    });
   }
 });
 
