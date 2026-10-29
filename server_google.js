@@ -847,6 +847,61 @@ async function salvarPagamentoSeloGoogle(dados) {
   return Array.isArray(response.data) ? response.data[0] || null : null;
 }
 
+// Atualiza o pagamento avulso do selo e revoga o selo somente para o usuário
+// vinculado ao purchaseToken. Não altera tab_usuarios nem assinaturas de planos.
+async function atualizarPagamentoSeloGooglePorToken(purchaseToken, dados) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_selo_google`,
+    params: { purchase_token: `eq.${purchaseToken}` },
+    headers: { ...obterHeadersSupabase(), Prefer: 'return=representation' },
+    data: { ...dados, updated_at: new Date().toISOString() },
+    timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data[0] || null : null;
+}
+
+async function revogarSeloVerificacaoGoogle(usuarioId, motivo) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const agora = new Date().toISOString();
+  const response = await axios({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_selo_verificacao`,
+    params: { usuario_id: `eq.${usuarioId}` },
+    headers: { ...obterHeadersSupabase(), Prefer: 'return=representation' },
+    data: {
+      status: 'rejeitado',
+      motivo_rejeicao: motivo || 'Pagamento do selo reembolsado ou anulado pela Google Play.',
+      updated_at: agora,
+    },
+    timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data.length : 0;
+}
+
+async function processarEstornoSeloGoogle(purchaseToken, registroSelo, eventoGoogle = null) {
+  if (!registroSelo?.usuario_id || !purchaseToken) {
+    return { processado: false, motivo: 'registro do selo incompleto' };
+  }
+  const agora = new Date().toISOString();
+  await atualizarPagamentoSeloGooglePorToken(purchaseToken, {
+    status_pagamento: 'estornado',
+  });
+  const selosAtualizados = await revogarSeloVerificacaoGoogle(
+    registroSelo.usuario_id,
+    'O pagamento do Selo de Verificação foi reembolsado ou anulado pela Google Play.'
+  );
+  logGoogle('SELO_GOOGLE_ESTORNO_PROCESSADO', {
+    usuario_id: registroSelo.usuario_id,
+    selo_id: registroSelo.selo_id || null,
+    order_id: eventoGoogle?.orderId || registroSelo.google_order_id || null,
+    selos_atualizados: selosAtualizados,
+    voided_time_millis: eventoGoogle?.voidedTimeMillis || null,
+  });
+  return { processado: true, status: 'estornado', selos_atualizados: selosAtualizados, atualizado_em: agora };
+}
+
 async function reconhecerCompraSeloGoogle(purchaseToken, productId) {
   const packageName = obterGooglePackageName();
   const accessToken = await obterAccessTokenGoogle();
@@ -3445,6 +3500,21 @@ app.get(
           });
       }
 
+      // O Selo de Verificação é um produto avulso independente dos planos.
+      // Consulta primeiro a tabela própria para não confundir o token com plano.
+      const pagamentoSelo = await buscarPagamentoSeloPorToken(purchaseToken);
+      if (pagamentoSelo) {
+        if (String(pagamentoSelo.usuario_id) !== String(usuario.id)) {
+          return res.status(404).json({ success: false, error: 'Compra do selo não encontrada para este usuário.' });
+        }
+        const anuladaSelo = await consultarCompraAnuladaGoogle(purchaseToken);
+        if (anuladaSelo) {
+          const resultadoEstorno = await processarEstornoSeloGoogle(purchaseToken, pagamentoSelo, anuladaSelo);
+          return res.json({ success: true, local: { ...pagamentoSelo, status_pagamento: 'estornado' }, google: null, sincronizado: true, status: 'estornado', selo_revogado: true, resultado: resultadoEstorno, pedido_anulado: { orderId: anuladaSelo.orderId || null, productType: anuladaSelo.productType || null, refundType: anuladaSelo.refundType || null, voidedTimeMillis: anuladaSelo.voidedTimeMillis || null } });
+        }
+        return res.json({ success: true, local: pagamentoSelo, sincronizado: false, status: pagamentoSelo.status_pagamento || 'pago', produto: 'selo_verificacao_avulso', selo_revogado: false });
+      }
+
       const registroLocal =
         await buscarAssinaturaGooglePorToken(
           purchaseToken
@@ -3691,6 +3761,26 @@ async function processarRtdnGooglePlay(payload) {
 
   const registro = await buscarAssinaturaGooglePorToken(token);
   if (!registro) {
+    const pagamentoSelo = await buscarPagamentoSeloPorToken(token);
+    const tipoNotificacaoSelo = Number(oneTime?.notificationType);
+    // ONE_TIME_PRODUCT_CANCELED = 2. A RTDN só é um aviso; o status final
+    // é confirmado consultando a API Voided Purchases do Google.
+    if (pagamentoSelo && oneTime && tipoNotificacaoSelo === 2) {
+      const anulada = await consultarCompraAnuladaGoogle(token);
+      if (anulada) return await processarEstornoSeloGoogle(token, pagamentoSelo, anulada);
+      logGoogle('RTDN_SELO_CANCELADO_AINDA_NAO_CONFIRMADO', {
+        usuario_id: pagamentoSelo.usuario_id,
+        purchase_token: mascararToken(token),
+      });
+      return { processado: true, alterou_acesso: false, motivo: 'Google ainda não confirmou a anulação do selo.' };
+    }
+    if (pagamentoSelo) {
+      logGoogle('RTDN_SELO_EVENTO_INFORMATIVO', {
+        usuario_id: pagamentoSelo.usuario_id,
+        notification_type: oneTime?.notificationType ?? null,
+      });
+      return { processado: true, alterou_acesso: false, motivo: 'evento do selo não indica estorno confirmado' };
+    }
     logGoogle('RTDN_TOKEN_NAO_ENCONTRADO', {
       purchase_token: token,
       sku: oneTime?.sku || null,
