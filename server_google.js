@@ -954,10 +954,22 @@ async function validarPagamentoSeloGoogle({ req, res, usuario, planoId, purchase
     return res.status(409).json({ success: false, validado: false, error: 'Este token já está vinculado a outra compra ou usuário.' });
   }
 
-  // REGRA DE SEGURANÇA: antes de gravar novamente como "pago", consultar a
-  // lista oficial de compras anuladas/reembolsadas do Google. Isso impede que
-  // uma nova validação do app ressuscite uma compra já reembolsada.
-  const compraAnulada = await consultarCompraAnuladaGoogle(purchaseToken);
+  // Consulta auxiliar de compras anuladas. Uma falha nesta API NÃO pode
+  // impedir uma NOVA compra legítima do selo. A compra só será marcada como
+  // estornada quando o Google confirmar positivamente a anulação.
+  // A proteção local de status terminal continua obrigatória logo abaixo.
+  let compraAnulada = null;
+  try {
+    compraAnulada = await consultarCompraAnuladaGoogle(purchaseToken);
+  } catch (error) {
+    logGoogle('GOOGLE_VOIDED_PURCHASES_FALHA_VALIDACAO_CONTINUA', {
+      request_id: requestId,
+      http_status: error.response?.status || null,
+      erro: error.response?.data?.error?.message ||
+        error.response?.data?.message || error.message,
+      nova_compra_nao_bloqueada: true,
+    });
+  }
   if (compraAnulada) {
     if (registroSeloAnterior) {
       const resultadoEstorno = await processarEstornoSeloGoogle(
@@ -3412,10 +3424,11 @@ async function consultarCompraAnuladaGoogle(purchaseToken) {
   const accessToken = await obterAccessTokenGoogle();
 
   // A API Voided Purchases deve ser consultada com uma janela temporal
-  // explícita. Para compras recentes, pesquisamos os últimos 30 dias.
+  // explícita. Usamos 29 dias para respeitar o limite estrito de 30 dias
+  // aplicado pelo Google, evitando rejeição no limite exato.
   // O parâmetro "token" abaixo é exclusivamente o cursor de paginação.
   const agora = Date.now();
-  const inicioJanela = agora - (30 * 24 * 60 * 60 * 1000);
+  const inicioJanela = agora - (29 * 24 * 60 * 60 * 1000);
   let tokenPaginacao = null;
   const maxPaginas = 50;
 
