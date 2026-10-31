@@ -3410,15 +3410,21 @@ async function consultarCompraAnuladaGoogle(purchaseToken) {
 
   const packageName = obterGooglePackageName();
   const accessToken = await obterAccessTokenGoogle();
-  let tokenPaginacao = null;
-  const maxPaginas = 10;
 
-  // IMPORTANTE:
-  // O parâmetro "token" da API voidedpurchases é um TOKEN DE PAGINAÇÃO,
-  // não o purchaseToken da compra. Enviar o purchaseToken aqui causa HTTP 400
-  // com "Invalid pagination token" e impede a sincronização do cancelamento.
+  // A API Voided Purchases deve ser consultada com uma janela temporal
+  // explícita. Para compras recentes, pesquisamos os últimos 30 dias.
+  // O parâmetro "token" abaixo é exclusivamente o cursor de paginação.
+  const agora = Date.now();
+  const inicioJanela = agora - (30 * 24 * 60 * 60 * 1000);
+  let tokenPaginacao = null;
+  const maxPaginas = 50;
+
   for (let pagina = 0; pagina < maxPaginas; pagina += 1) {
-    const params = { maxResults: 1000 };
+    const params = {
+      maxResults: 1000,
+      startTime: inicioJanela,
+      endTime: agora,
+    };
     if (tokenPaginacao) params.token = tokenPaginacao;
 
     const response = await axios({
@@ -3442,16 +3448,37 @@ async function consultarCompraAnuladaGoogle(purchaseToken) {
     const compraAnulada = itens.find((item) =>
       String(item?.purchaseToken || '').trim() === purchaseTokenAlvo
     );
-    if (compraAnulada) return compraAnulada;
 
-    // A API devolve o próximo token dentro de tokenPagination. Só esse valor
-    // pode ser enviado no parâmetro "token" da próxima página.
+    logGoogle('GOOGLE_VOIDED_PURCHASES_PAGINA', {
+      pagina: pagina + 1,
+      itens_retornados: itens.length,
+      encontrou_compra: Boolean(compraAnulada),
+      possui_proxima_pagina: Boolean(response.data?.tokenPagination?.nextPageToken),
+    });
+
+    if (compraAnulada) {
+      logGoogle('GOOGLE_VOIDED_PURCHASES_COMPRA_ENCONTRADA', {
+        order_id: compraAnulada.orderId || null,
+        product_type: compraAnulada.productType || null,
+        refund_type: compraAnulada.refundType || null,
+        voided_time_millis: compraAnulada.voidedTimeMillis || null,
+      });
+      return compraAnulada;
+    }
+
     const proximoToken = String(
       response.data?.tokenPagination?.nextPageToken || ''
     ).trim();
+
     if (!proximoToken || proximoToken === tokenPaginacao) break;
     tokenPaginacao = proximoToken;
   }
+
+  logGoogle('GOOGLE_VOIDED_PURCHASES_COMPRA_NAO_ENCONTRADA', {
+    janela_inicio: new Date(inicioJanela).toISOString(),
+    janela_fim: new Date(agora).toISOString(),
+    paginas_consultadas: maxPaginas,
+  });
 
   return null;
 }
