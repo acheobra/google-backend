@@ -3808,7 +3808,7 @@ app.get(
 );
 
 // ============================================================
-// GOOGLE PLAY RTDN (PUB/SUB PUSH) - SINCRONIZA CANCELAMENTOS
+// GOOGLE PLAY RTDN (PUB/SUB PUSH) - SINCRONIZA PLANOS E SELO
 // ============================================================
 // Configure a assinatura Pub/Sub do tipo PUSH para chamar:
 // https://SEU-SERVICO.onrender.com/google/pubsub/rtdn?token=GOOGLE_PUBSUB_PUSH_TOKEN
@@ -3867,24 +3867,66 @@ async function processarRtdnGooglePlay(payload) {
   if (!registro) {
     const pagamentoSelo = await buscarPagamentoSeloPorToken(token);
     const tipoNotificacaoSelo = Number(oneTime?.notificationType);
-    // ONE_TIME_PRODUCT_CANCELED = 2. A RTDN só é um aviso; o status final
-    // é confirmado consultando a API Voided Purchases do Google.
-    if (pagamentoSelo && oneTime && tipoNotificacaoSelo === 2) {
-      const anulada = await consultarCompraAnuladaGoogle(token);
-      if (anulada) return await processarEstornoSeloGoogle(token, pagamentoSelo, anulada);
-      logGoogle('RTDN_SELO_CANCELADO_AINDA_NAO_CONFIRMADO', {
+    const produtoNotificado = String(oneTime?.sku || '').trim();
+
+    // ONE_TIME_PRODUCT_CANCELED = 2.
+    // Para um token já vinculado ao pagamento do Selo, a RTDN oficial é o
+    // aviso do Google de que a compra avulsa foi cancelada/revogada.
+    // Não condicionamos a revogação à Voided Purchases, pois essa consulta
+    // pode demorar a refletir o evento. O token precisa estar previamente
+    // registrado em tab_pagamentos_selo_google e o SKU, quando informado,
+    // deve corresponder ao produto do selo.
+    if (
+      pagamentoSelo &&
+      oneTime &&
+      tipoNotificacaoSelo === 2 &&
+      (!produtoNotificado || produtoNotificado === GOOGLE_SELO_PRODUCT_ID)
+    ) {
+      logGoogle('RTDN_SELO_CANCELAMENTO_CONFIRMADO', {
         usuario_id: pagamentoSelo.usuario_id,
+        selo_id: pagamentoSelo.selo_id || null,
+        notification_type: tipoNotificacaoSelo,
+        sku: produtoNotificado || null,
         purchase_token: mascararToken(token),
+        fonte: 'google_play_rtdn',
       });
-      return { processado: true, alterou_acesso: false, motivo: 'Google ainda não confirmou a anulação do selo.' };
+
+      const resultado = await processarEstornoSeloGoogle(
+        token,
+        pagamentoSelo,
+        {
+          orderId: pagamentoSelo.google_order_id || null,
+          notificationType: tipoNotificacaoSelo,
+          fonte: 'google_play_rtdn',
+        }
+      );
+
+      logGoogle('RTDN_SELO_ESTORNO_CONCLUIDO', {
+        usuario_id: pagamentoSelo.usuario_id,
+        selo_id: pagamentoSelo.selo_id || null,
+        processado: Boolean(resultado?.processado),
+        selos_atualizados: resultado?.selos_atualizados || 0,
+      });
+
+      return {
+        processado: true,
+        tipo: 'selo_verificacao',
+        status: 'estornado',
+        selo_revogado: Boolean(resultado?.selos_atualizados > 0),
+        resultado,
+      };
     }
+
     if (pagamentoSelo) {
       logGoogle('RTDN_SELO_EVENTO_INFORMATIVO', {
         usuario_id: pagamentoSelo.usuario_id,
+        selo_id: pagamentoSelo.selo_id || null,
         notification_type: oneTime?.notificationType ?? null,
+        sku: produtoNotificado || null,
       });
-      return { processado: true, alterou_acesso: false, motivo: 'evento do selo não indica estorno confirmado' };
+      return { processado: true, alterou_acesso: false, motivo: 'evento do selo não indica cancelamento/revogação' };
     }
+
     logGoogle('RTDN_TOKEN_NAO_ENCONTRADO', {
       purchase_token: token,
       sku: oneTime?.sku || null,
