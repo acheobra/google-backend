@@ -954,6 +954,56 @@ async function validarPagamentoSeloGoogle({ req, res, usuario, planoId, purchase
     return res.status(409).json({ success: false, validado: false, error: 'Este token já está vinculado a outra compra ou usuário.' });
   }
 
+  // REGRA DE SEGURANÇA: antes de gravar novamente como "pago", consultar a
+  // lista oficial de compras anuladas/reembolsadas do Google. Isso impede que
+  // uma nova validação do app ressuscite uma compra já reembolsada.
+  const compraAnulada = await consultarCompraAnuladaGoogle(purchaseToken);
+  if (compraAnulada) {
+    if (registroSeloAnterior) {
+      const resultadoEstorno = await processarEstornoSeloGoogle(
+        purchaseToken,
+        registroSeloAnterior,
+        compraAnulada
+      );
+      return res.status(409).json({
+        success: false,
+        validado: false,
+        purchase_valid: false,
+        pago: false,
+        status: 'estornado',
+        status_google: 'VOIDED',
+        selo_revogado: resultadoEstorno.selos_atualizados > 0,
+        error: 'O Google confirmou que esta compra foi reembolsada/anulada. O selo foi revogado.',
+      });
+    }
+    return res.status(409).json({
+      success: false,
+      validado: false,
+      purchase_valid: false,
+      pago: false,
+      status: 'estornado',
+      status_google: 'VOIDED',
+      error: 'O Google confirmou que esta compra foi reembolsada/anulada. Nenhum pagamento foi registrado.',
+    });
+  }
+
+  // Um status terminal local nunca pode ser substituído por "pago" apenas
+  // porque o aplicativo repetiu a validação. O diagnóstico oficial pode
+  // reconciliar o registro quando o Google confirmar o estorno.
+  const statusLocalAnterior = String(
+    registroSeloAnterior?.status_pagamento || ''
+  ).trim().toLowerCase();
+  if (['estornado', 'reembolsado', 'cancelado', 'anulado'].includes(statusLocalAnterior)) {
+    return res.status(409).json({
+      success: false,
+      validado: false,
+      purchase_valid: false,
+      pago: false,
+      status: statusLocalAnterior,
+      error: 'Esta compra já está marcada como encerrada no sistema e não será reativada por uma nova validação.',
+    });
+  }
+
   const compraGoogle = await consultarProdutoAvulsoGoogle(purchaseToken);
   const item = localizarLineItemProdutoAvulso(compraGoogle, GOOGLE_SELO_PRODUCT_ID);
   if (!item) {
