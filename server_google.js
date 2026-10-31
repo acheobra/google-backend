@@ -3927,14 +3927,25 @@ async function processarRtdnGooglePlay(payload) {
       return { processado: true, alterou_acesso: false, motivo: 'evento do selo não indica cancelamento/revogação' };
     }
 
-    logGoogle('RTDN_TOKEN_NAO_ENCONTRADO', {
+    logGoogle('RTDN_TOKEN_NAO_ENCONTRADO_RETRY', {
       purchase_token: token,
       sku: oneTime?.sku || null,
       notification_type: oneTime?.notificationType ?? subscription?.notificationType ?? null,
+      message_id: mensagem.messageId || null,
+      publish_time: mensagem.publishTime || null,
+      motivo: 'O evento chegou antes do registro local; solicitar nova entrega ao Pub/Sub.',
     });
-    // 200: não ficar repetindo indefinidamente. A sincronização manual pode resolver
-    // eventos recebidos antes de o registro local ser criado.
-    return { ignorado: true, motivo: 'purchaseToken sem registro local' };
+
+    // IMPORTANTE:
+    // Não responder 200 quando o token ainda não existe no Supabase.
+    // O Pub/Sub interpreta HTTP 200 como confirmação definitiva e não
+    // entrega novamente a mensagem. Responder com erro faz o Pub/Sub
+    // tentar novamente, permitindo que o app conclua o registro da compra.
+    // Isso evita perder uma notificação de reembolso que chegue antes
+    // ou quase ao mesmo tempo que a gravação do pagamento.
+    throw new Error(
+      'RTDN aguardando registro local do purchaseToken. O Pub/Sub deve tentar novamente.'
+    );
   }
 
   const tipo = String(registro.tipo_compra || (subscription ? 'recorrente' : 'avulso')).toLowerCase();
