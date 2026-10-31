@@ -3852,7 +3852,13 @@ async function processarRtdnGooglePlay(payload) {
 
   const oneTime = evento.oneTimeProductNotification;
   const subscription = evento.subscriptionNotification;
-  const token = String(oneTime?.purchaseToken || subscription?.purchaseToken || '').trim();
+  const voided = evento.voidedPurchaseNotification;
+  const token = String(
+    oneTime?.purchaseToken ||
+    subscription?.purchaseToken ||
+    voided?.purchaseToken ||
+    ''
+  ).trim();
   if (!token) {
     // Test notifications não carregam purchaseToken; responder 200 evita retries inúteis.
     if (evento.testNotification) {
@@ -3861,6 +3867,63 @@ async function processarRtdnGooglePlay(payload) {
     }
     logGoogle('RTDN_SEM_PURCHASE_TOKEN', { package_name: pacote || pacoteEsperado });
     return { ignorado: true, motivo: 'evento sem purchaseToken' };
+  }
+
+  // Reembolso de compra avulsa já concluída chega como
+  // voidedPurchaseNotification, não necessariamente como
+  // ONE_TIME_PRODUCT_CANCELED. O Google identifica compra única com
+  // productType = 2. Tratar esse evento antes do fluxo de assinaturas.
+  if (voided && Number(voided.productType) === 2) {
+    const pagamentoSeloVoid = await buscarPagamentoSeloPorToken(token);
+
+    if (pagamentoSeloVoid) {
+      logGoogle('RTDN_SELO_REEMBOLSO_RECEBIDO', {
+        usuario_id: pagamentoSeloVoid.usuario_id,
+        selo_id: pagamentoSeloVoid.selo_id || null,
+        order_id: voided.orderId || pagamentoSeloVoid.google_order_id || null,
+        product_type: Number(voided.productType),
+        refund_type: voided.refundType ?? null,
+        purchase_token: mascararToken(token),
+        fonte: 'voided_purchase_notification',
+      });
+
+      const resultadoVoid = await processarEstornoSeloGoogle(
+        token,
+        pagamentoSeloVoid,
+        {
+          orderId: voided.orderId || pagamentoSeloVoid.google_order_id || null,
+          refundType: voided.refundType ?? null,
+          voidedTimeMillis: evento.eventTimeMillis || null,
+          fonte: 'voided_purchase_notification',
+        }
+      );
+
+      logGoogle('RTDN_SELO_REEMBOLSO_CONCLUIDO', {
+        usuario_id: pagamentoSeloVoid.usuario_id,
+        selo_id: pagamentoSeloVoid.selo_id || null,
+        processado: Boolean(resultadoVoid?.processado),
+        selos_atualizados: resultadoVoid?.selos_atualizados || 0,
+      });
+
+      return {
+        processado: true,
+        tipo: 'selo_verificacao',
+        status: 'estornado',
+        selo_revogado: Boolean(resultadoVoid?.selos_atualizados > 0),
+        resultado: resultadoVoid,
+      };
+    }
+
+    logGoogle('RTDN_SELO_REEMBOLSO_SEM_REGISTRO_RETRY', {
+      purchase_token: mascararToken(token),
+      order_id: voided.orderId || null,
+      product_type: Number(voided.productType),
+      message_id: mensagem.messageId || null,
+      publish_time: mensagem.publishTime || null,
+    });
+    // Não confirmar um reembolso antes de o pagamento existir localmente.
+    // O Pub/Sub fará nova tentativa após a gravação do pagamento.
+    throw new Error('RTDN de reembolso do selo aguardando registro local do purchaseToken.');
   }
 
   const registro = await buscarAssinaturaGooglePorToken(token);
