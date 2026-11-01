@@ -3977,6 +3977,507 @@ async function buscarUsuarioGooglePorId(usuarioId) {
   return Array.isArray(response.data) ? response.data[0] || null : null;
 }
 
+// ============================================================
+// SINCRONIZAÇÃO AUTOMÁTICA DOS PLANOS GOOGLE (AVULSO + RECORRENTE)
+// ============================================================
+// Fonte de verdade:
+// - Compra avulsa: Orders.get (REFUNDED) e, como fallback, Voided Purchases.
+// - Assinatura: purchases.subscriptionsv2.get.
+// O Supabase e o perfil do usuário são atualizados pelo backend, mesmo sem
+// que o aplicativo seja aberto. O fluxo do Selo permanece independente.
+
+const STATUS_PLANO_GOOGLE_ATIVO = new Set([
+  'ativo',
+  'pago',
+  'carencia',
+]);
+
+function obterTipoCompraRegistroGoogle(registro) {
+  const tipo = String(registro?.tipo_compra || '').trim().toLowerCase();
+  if (tipo === 'recorrente' || registro?.recorrente === true ||
+      String(registro?.google_base_plan_id || '').trim()) {
+    return 'recorrente';
+  }
+  return 'avulso';
+}
+
+async function consultarEstornoPlanoAvulsoGoogle(purchaseToken, registro) {
+  const token = String(purchaseToken || '').trim();
+  const orderIdLocal = String(registro?.google_order_id || '').trim();
+  const productIdLocal = String(registro?.google_product_id || '').trim();
+  if (!token) return null;
+
+  if (orderIdLocal) {
+    try {
+      const pedido = await consultarPedidoGooglePorOrderId(orderIdLocal);
+      const orderIdGoogle = String(pedido?.orderId || '').trim();
+      const tokenGoogle = String(pedido?.purchaseToken || '').trim();
+      const produtosGoogle = Array.isArray(pedido?.lineItems)
+        ? pedido.lineItems.map((item) => String(item?.productId || '').trim())
+        : [];
+      const estado = String(pedido?.state || '').trim().toUpperCase();
+
+      if (orderIdGoogle && orderIdGoogle !== orderIdLocal) {
+        throw new Error('orders.get retornou orderId diferente do registro local.');
+      }
+      if (tokenGoogle && tokenGoogle !== token) {
+        throw new Error('orders.get retornou purchaseToken diferente do registro local.');
+      }
+      if (productIdLocal && produtosGoogle.length && !produtosGoogle.includes(productIdLocal)) {
+        logGoogle('PLANO_AVULSO_ORDERS_GET_PRODUTO_DIVERGENTE', {
+          order_id: orderIdLocal,
+          purchase_token: token,
+          produto_local: productIdLocal,
+          produtos_google: produtosGoogle,
+        });
+        return null;
+      }
+
+      logGoogle('PLANO_AVULSO_ORDERS_GET_STATUS', {
+        usuario_id: registro.usuario_id || null,
+        plano_id: registro.plano_id || null,
+        order_id: orderIdLocal,
+        purchase_token: token,
+        order_state: estado || 'DESCONHECIDO',
+      });
+
+      if (estado === 'REFUNDED') {
+        logGoogle('PLANO_AVULSO_REEMBOLSO_CONFIRMADO', {
+          usuario_id: registro.usuario_id || null,
+          plano_id: registro.plano_id || null,
+          order_id: orderIdLocal,
+          purchase_token: token,
+          state: estado,
+          last_event_time: pedido?.lastEventTime || null,
+        });
+        return {
+          orderId: orderIdGoogle || orderIdLocal,
+          purchaseToken: token,
+          orderState: estado,
+          lastEventTime: pedido?.lastEventTime || null,
+          refundType: 'orders_get_refunded',
+          fonte: 'orders_get',
+        };
+      }
+
+      if (['PENDING_REFUND', 'PARTIALLY_REFUNDED'].includes(estado)) {
+        logGoogle('PLANO_AVULSO_REEMBOLSO_AINDA_NAO_INTEGRAL', {
+          order_id: orderIdLocal,
+          purchase_token: token,
+          order_state: estado,
+        });
+        return null;
+      }
+
+      // PROCESSED/CANCELED são respostas válidas e não justificam procurar
+      // outra compra nem revogar o plano como se houvesse reembolso.
+      if (estado) return null;
+    } catch (error) {
+      logGoogle('PLANO_AVULSO_ORDERS_GET_FALHA', {
+        usuario_id: registro.usuario_id || null,
+        plano_id: registro.plano_id || null,
+        order_id: orderIdLocal,
+        purchase_token: token,
+        http_status: error.response?.status || null,
+        erro: error.response?.data?.error?.message ||
+          error.response?.data?.message || error.message,
+        fallback: 'voided_purchases',
+      });
+    }
+  }
+
+  // Fallback somente quando o pedido não existe localmente ou orders.get falhou.
+  const anulada = await consultarCompraAnuladaGoogle(token);
+  if (!anulada) return null;
+
+  const orderIdAnulado = String(anulada.orderId || '').trim();
+  if (orderIdLocal && orderIdAnulado && orderIdLocal !== orderIdAnulado) {
+    logGoogle('PLANO_AVULSO_VOIDED_ORDER_DIVERGENTE', {
+      order_id_local: orderIdLocal,
+      order_id_google: orderIdAnulado,
+      purchase_token: token,
+    });
+    return null;
+  }
+  if (Number(anulada.productType) !== 2) return null;
+
+  return {
+    ...anulada,
+    orderId: orderIdAnulado || orderIdLocal || null,
+    purchaseToken: token,
+    orderState: 'REFUNDED',
+    fonte: 'voided_purchases',
+  };
+}
+
+async function verificarOutraCompraAtivaMesmoPlanoGoogle(registro, tipoCompra) {
+  const usuarioId = registro?.usuario_id;
+  const planoId = String(registro?.plano_id || '');
+  const tokenAtual = String(registro?.purchase_token || '');
+  if (!usuarioId || !planoId) return false;
+
+  const historico = await buscarAssinaturasGoogleDoUsuario(usuarioId);
+  return historico.some((item) => {
+    if (String(item?.purchase_token || '') === tokenAtual) return false;
+    if (String(item?.plano_id || '') !== planoId) return false;
+    if (obterTipoCompraRegistroGoogle(item) !== tipoCompra) return false;
+    const status = String(item?.status_assinatura || '').trim().toLowerCase();
+    return STATUS_PLANO_GOOGLE_ATIVO.has(status);
+  });
+}
+
+async function encerrarPlanoGooglePorCompraAnulada(registro, tipoCompra, statusFinal, evento = {}) {
+  const token = String(registro?.purchase_token || '').trim();
+  const usuarioId = registro?.usuario_id;
+  const planoId = registro?.plano_id;
+  if (!token || !usuarioId || planoId == null) {
+    throw new Error('Registro de plano Google incompleto para encerrar a compra.');
+  }
+
+  const agora = new Date().toISOString();
+  const dadosAtualizacao = {
+    status_assinatura: statusFinal,
+    tipo_compra: tipoCompra,
+    recorrente: tipoCompra === 'recorrente',
+    auto_renovacao: false,
+    cancelado_em: registro.cancelado_em || agora,
+    updated_at: agora,
+  };
+  const atualizado = await atualizarAssinaturaGooglePorToken(token, dadosAtualizacao);
+  if (!atualizado) {
+    throw new Error('O Supabase não retornou a assinatura atualizada em tab_assinaturas_google.');
+  }
+
+  const usuario = await buscarUsuarioGooglePorId(usuarioId);
+  if (!usuario) {
+    logGoogle('PLANO_GOOGLE_USUARIO_NAO_ENCONTRADO', {
+      usuario_id: usuarioId,
+      plano_id: planoId,
+      tipo_compra: tipoCompra,
+    });
+    return { atualizado: true, plano_gratis_ativado: false, motivo: 'usuário não encontrado' };
+  }
+
+  const planoAtualId = String(usuario.plano_id || usuario.id_plano_atual || '');
+  if (planoAtualId !== String(planoId)) {
+    logGoogle('PLANO_GOOGLE_ACESSO_PRESERVADO_PLANO_DIFERENTE', {
+      usuario_id: usuarioId,
+      plano_da_compra: planoId,
+      plano_atual: planoAtualId || null,
+      tipo_compra: tipoCompra,
+      status_final: statusFinal,
+    });
+    return { atualizado: true, plano_gratis_ativado: false, motivo: 'usuário já está em outro plano' };
+  }
+
+  // Se existe outra compra ativa do mesmo plano e modalidade, um evento antigo
+  // não pode derrubar a compra mais recente do usuário.
+  const outraCompraAtiva = await verificarOutraCompraAtivaMesmoPlanoGoogle(registro, tipoCompra);
+  if (outraCompraAtiva) {
+    logGoogle('PLANO_GOOGLE_ACESSO_PRESERVADO_OUTRA_COMPRA_ATIVA', {
+      usuario_id: usuarioId,
+      plano_id: planoId,
+      tipo_compra: tipoCompra,
+    });
+    return { atualizado: true, plano_gratis_ativado: false, motivo: 'outra compra ativa do mesmo plano' };
+  }
+
+  const planoAtual = await buscarPlanoGooglePorId(planoId);
+  if (!planoAtual) throw new Error(`Plano ${planoId} não encontrado em tab_planos.`);
+  const downgrade = await retornarUsuarioAoPlanoGratisGoogle({ usuarioId, planoAtual });
+
+  logGoogle('PLANO_GOOGLE_ACESSO_REVOGADO', {
+    usuario_id: usuarioId,
+    plano_cancelado_id: planoId,
+    plano_gratis_id: downgrade.planoGratis.id,
+    tipo_compra: tipoCompra,
+    status_final: statusFinal,
+    order_id: evento.orderId || registro.google_order_id || null,
+    fonte: evento.fonte || 'subscriptionsv2',
+  });
+
+  return {
+    atualizado: true,
+    plano_gratis_ativado: true,
+    plano_gratis: downgrade.planoGratis,
+    status: statusFinal,
+  };
+}
+
+async function sincronizarRegistroPlanoGoogle(registro, opcoes = {}) {
+  const token = String(registro?.purchase_token || '').trim();
+  if (!token) throw new Error('Registro de plano sem purchase_token.');
+  const tipoCompra = obterTipoCompraRegistroGoogle(registro);
+  const { oneTime = null, subscription = null, voided = null, origem = 'reconciliacao' } = opcoes;
+
+  if (tipoCompra === 'avulso') {
+    const skuNotificado = String(oneTime?.sku || '').trim();
+    const produtoLocal = String(registro.google_product_id || '').trim();
+    if (oneTime && skuNotificado && produtoLocal && skuNotificado !== produtoLocal) {
+      logGoogle('PLANO_AVULSO_RTND_SKU_DIVERGENTE', {
+        usuario_id: registro.usuario_id || null,
+        plano_id: registro.plano_id || null,
+        sku_notificado: skuNotificado,
+        produto_local: produtoLocal,
+      });
+      return { processado: true, alterou_acesso: false, motivo: 'SKU divergente' };
+    }
+
+    let confirmacao = null;
+    if (Number(oneTime?.notificationType) === 2) {
+      confirmacao = {
+        orderId: registro.google_order_id || null,
+        orderState: 'REFUNDED',
+        fonte: 'one_time_product_canceled_rtdn',
+        notificationType: 2,
+      };
+    } else if (voided && Number(voided.productType) === 2) {
+      const orderIdEvento = String(voided.orderId || '').trim();
+      const orderIdLocal = String(registro.google_order_id || '').trim();
+      if (orderIdEvento && orderIdLocal && orderIdEvento !== orderIdLocal) {
+        throw new Error('voidedPurchaseNotification orderId diverge do pedido registrado.');
+      }
+      confirmacao = {
+        orderId: orderIdEvento || orderIdLocal || null,
+        orderState: 'REFUNDED',
+        refundType: voided.refundType ?? null,
+        voidedTimeMillis: voided.voidedTimeMillis || null,
+        fonte: 'voided_purchase_notification',
+      };
+    } else {
+      confirmacao = await consultarEstornoPlanoAvulsoGoogle(token, registro);
+    }
+
+    if (!confirmacao) {
+      return { processado: true, alterou_acesso: false, tipo_compra: 'avulso', motivo: 'Google ainda não confirmou reembolso integral' };
+    }
+
+    const resultado = await encerrarPlanoGooglePorCompraAnulada(
+      registro,
+      'avulso',
+      'estornado',
+      confirmacao
+    );
+    logGoogle('PLANO_AVULSO_REEMBOLSO_SINCRONIZADO', {
+      usuario_id: registro.usuario_id || null,
+      plano_id: registro.plano_id || null,
+      order_id: confirmacao.orderId || registro.google_order_id || null,
+      fonte: confirmacao.fonte || origem,
+      plano_gratis_ativado: Boolean(resultado.plano_gratis_ativado),
+    });
+    return { processado: true, tipo_compra: 'avulso', status: 'estornado', ...resultado };
+  }
+
+  // Para recorrentes, subscriptionsv2.get é a fonte oficial do estado atual.
+  const assinaturaGoogle = await consultarAssinaturaGoogle(token);
+  const produtoLocal = String(registro.google_product_id || '').trim();
+  const lineItem = localizarLineItemDoProduto(assinaturaGoogle, produtoLocal);
+  if (!lineItem) {
+    throw new Error('subscriptionsv2.get não retornou lineItem correspondente ao produto registrado.');
+  }
+
+  const basePlanLocal = String(registro.google_base_plan_id || '').trim();
+  const basePlanGoogle = extrairBasePlanId(lineItem);
+  if (basePlanLocal && basePlanGoogle && basePlanLocal !== basePlanGoogle) {
+    throw new Error('subscriptionsv2.get retornou basePlanId diferente do registro local.');
+  }
+
+  const estadoGoogle = String(assinaturaGoogle?.subscriptionState || '').trim().toUpperCase();
+  const expiryTime = lineItem?.expiryTime || registro.data_expiracao || null;
+  const autoRenovacao = extrairAutoRenovacao(lineItem);
+  const mapeado = mapearStatusGoogleParaInterno(estadoGoogle, expiryTime);
+  const renovacaoDesativada = autoRenovacao === false;
+  let statusInterno = mapeado.statusInterno;
+
+  // Mantém a regra comercial já existente no Ache Obra: cancelar uma
+  // assinatura encerra os benefícios pagos imediatamente, mesmo que a
+  // validade original ainda não tenha terminado.
+  if (estadoGoogle === 'SUBSCRIPTION_STATE_CANCELED' ||
+      (estadoGoogle === 'SUBSCRIPTION_STATE_ACTIVE' && renovacaoDesativada)) {
+    statusInterno = 'cancelado_com_acesso';
+  }
+  if (estadoGoogle === 'SUBSCRIPTION_STATE_EXPIRED') statusInterno = 'expirado';
+  if (estadoGoogle === 'SUBSCRIPTION_STATE_ON_HOLD') statusInterno = 'suspenso';
+  if (estadoGoogle === 'SUBSCRIPTION_STATE_PAUSED') statusInterno = 'pausado';
+  if (estadoGoogle === 'SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED') statusInterno = 'cancelado';
+
+  const agora = new Date().toISOString();
+  const assinaturaAtualizada = await atualizarAssinaturaGooglePorToken(token, {
+    status_assinatura: statusInterno,
+    tipo_compra: 'recorrente',
+    recorrente: true,
+    auto_renovacao: autoRenovacao,
+    data_expiracao: expiryTime,
+    cancelado_em: (estadoGoogle === 'SUBSCRIPTION_STATE_CANCELED' || renovacaoDesativada)
+      ? (registro.cancelado_em || agora)
+      : (estadoGoogle === 'SUBSCRIPTION_STATE_EXPIRED' ? (registro.cancelado_em || agora) : null),
+    updated_at: agora,
+  });
+  if (!assinaturaAtualizada) {
+    throw new Error('Nenhum registro foi atualizado em tab_assinaturas_google para esta assinatura recorrente.');
+  }
+
+  logGoogle('PLANO_RECORRENTE_STATUS_SINCRONIZADO', {
+    usuario_id: registro.usuario_id || null,
+    plano_id: registro.plano_id || null,
+    purchase_token: token,
+    subscription_state: estadoGoogle,
+    status_interno: statusInterno,
+    auto_renovacao: autoRenovacao,
+    data_expiracao: expiryTime,
+    origem,
+    notification_type: subscription?.notificationType ?? null,
+  });
+
+  const tipoNotificacaoAssinatura = Number(subscription?.notificationType);
+  const encerramentoConfirmadoPorRtdn = [12, 13].includes(tipoNotificacaoAssinatura);
+  const encerrarAcesso = encerramentoConfirmadoPorRtdn || [
+    'SUBSCRIPTION_STATE_CANCELED',
+    'SUBSCRIPTION_STATE_EXPIRED',
+    'SUBSCRIPTION_STATE_ON_HOLD',
+    'SUBSCRIPTION_STATE_PAUSED',
+    'SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED',
+  ].includes(estadoGoogle) ||
+    (estadoGoogle === 'SUBSCRIPTION_STATE_ACTIVE' && renovacaoDesativada);
+
+  if (encerrarAcesso) {
+    const statusFinal = (estadoGoogle === 'SUBSCRIPTION_STATE_EXPIRED' || tipoNotificacaoAssinatura === 13)
+      ? 'expirado'
+      : estadoGoogle === 'SUBSCRIPTION_STATE_ON_HOLD'
+        ? 'suspenso'
+        : estadoGoogle === 'SUBSCRIPTION_STATE_PAUSED'
+          ? 'pausado'
+          : (estadoGoogle === 'SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED' || tipoNotificacaoAssinatura === 12)
+            ? 'cancelado'
+            : statusInterno;
+    const resultado = await encerrarPlanoGooglePorCompraAnulada(
+      { ...registro, ...(assinaturaAtualizada || {}), cancelado_em: assinaturaAtualizada?.cancelado_em || registro.cancelado_em },
+      'recorrente',
+      statusFinal,
+      { orderId: registro.google_order_id || null, fonte: 'subscriptionsv2', subscriptionState: estadoGoogle }
+    );
+    return { processado: true, tipo_compra: 'recorrente', status: statusFinal, ...resultado };
+  }
+
+  // Se a assinatura voltou a ficar ativa (por exemplo, recuperação de conta
+  // ou retomada), sincroniza o perfil quando ele ainda está no plano esperado
+  // ou no Grátis. Nunca substitui um plano pago diferente.
+  if (['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD'].includes(estadoGoogle)) {
+    const usuario = await buscarUsuarioGooglePorId(registro.usuario_id);
+    const plano = await buscarPlanoGooglePorId(registro.plano_id);
+    if (usuario && plano) {
+      const planoAtualId = String(usuario.plano_id || usuario.id_plano_atual || '');
+      const nomeAtual = normalizarTextoPlanoGoogle(usuario.nome_plano_ativo);
+      const estaNoGratis = nomeAtual.includes('gratis');
+      if (planoAtualId === String(registro.plano_id) || estaNoGratis) {
+        const outraCompraAtiva = await verificarOutraCompraAtivaMesmoPlanoGoogle(registro, 'recorrente');
+        if (!outraCompraAtiva) {
+          await atualizarPlanoAtivoUsuarioGoogle({
+            usuarioId: registro.usuario_id,
+            plano,
+            recorrente: true,
+            dataAtivacao: assinaturaGoogle.startTime || registro.data_inicio || agora,
+          });
+          logGoogle('PLANO_RECORRENTE_ACESSO_ATIVO_SINCRONIZADO', {
+            usuario_id: registro.usuario_id,
+            plano_id: registro.plano_id,
+            subscription_state: estadoGoogle,
+          });
+        }
+      } else {
+        logGoogle('PLANO_RECORRENTE_PERFIL_PRESERVADO_PLANO_DIFERENTE', {
+          usuario_id: registro.usuario_id,
+          plano_compra: registro.plano_id,
+          plano_atual: planoAtualId || null,
+        });
+      }
+    }
+  }
+
+  return {
+    processado: true,
+    tipo_compra: 'recorrente',
+    status: statusInterno,
+    assinatura: assinaturaAtualizada || registro,
+    acesso_encerrado: false,
+  };
+}
+
+async function reconciliarPlanosGoogle() {
+  if (reconciliacaoPlanosEmAndamento) {
+    logGoogle('PLANOS_RECONCILIACAO_PULADA_EM_ANDAMENTO');
+    return;
+  }
+  reconciliacaoPlanosEmAndamento = true;
+  let verificados = 0;
+  let alterados = 0;
+  let falhas = 0;
+
+  try {
+    const { supabaseUrl } = obterConfiguracaoSupabase();
+    const response = await axios({
+      method: 'GET',
+      url: `${supabaseUrl}/rest/v1/tab_assinaturas_google`,
+      params: {
+        select: '*',
+        status_assinatura: 'in.(ativo,pago,carencia,cancelado_com_acesso,suspenso,pausado)',
+        order: 'updated_at.asc',
+        limit: 1000,
+      },
+      headers: obterHeadersSupabase(),
+      timeout: 30000,
+    });
+    const registros = Array.isArray(response.data) ? response.data : [];
+    logGoogle('PLANOS_RECONCILIACAO_INICIO', {
+      registros_encontrados: registros.length,
+      avulsos: registros.filter((r) => obterTipoCompraRegistroGoogle(r) === 'avulso').length,
+      recorrentes: registros.filter((r) => obterTipoCompraRegistroGoogle(r) === 'recorrente').length,
+      limite_consulta: 1000,
+    });
+
+    for (const registro of registros) {
+      if (!registro?.purchase_token || !registro?.usuario_id || registro?.plano_id == null) continue;
+      verificados += 1;
+      try {
+        const resultado = await sincronizarRegistroPlanoGoogle(registro, { origem: 'reconciliacao_automatica' });
+        if (resultado?.status === 'estornado' || resultado?.plano_gratis_ativado ||
+            (resultado?.tipo_compra === 'recorrente' && resultado?.status)) {
+          alterados += 1;
+        }
+      } catch (error) {
+        falhas += 1;
+        logGoogle('PLANOS_RECONCILIACAO_REGISTRO_ERRO', {
+          usuario_id: registro.usuario_id || null,
+          plano_id: registro.plano_id || null,
+          tipo_compra: obterTipoCompraRegistroGoogle(registro),
+          purchase_token: registro.purchase_token,
+          http_status: error.response?.status || null,
+          erro: error.response?.data?.error?.message ||
+            error.response?.data?.message || error.message,
+        });
+      }
+    }
+
+    logGoogle('PLANOS_RECONCILIACAO_CONCLUIDA', {
+      registros_verificados: verificados,
+      registros_com_alteracao_ou_estado_sincronizado: alterados,
+      falhas,
+      limite_consulta: 1000,
+      atingiu_limite: registros.length === 1000,
+    });
+  } catch (error) {
+    logGoogle('PLANOS_RECONCILIACAO_ERRO_GERAL', {
+      http_status: error.response?.status || null,
+      erro: error.response?.data?.error?.message ||
+        error.response?.data?.message || error.message,
+    });
+  } finally {
+    reconciliacaoPlanosEmAndamento = false;
+  }
+}
+
+let reconciliacaoPlanosEmAndamento = false;
+
 async function processarRtdnGooglePlay(payload) {
   const mensagem = payload?.message;
   if (!mensagem?.data) throw new Error('Mensagem Pub/Sub sem message.data.');
@@ -4056,6 +4557,20 @@ async function processarRtdnGooglePlay(payload) {
         status: 'estornado',
         selo_revogado: Boolean(resultadoVoid?.selos_atualizados > 0),
         resultado: resultadoVoid,
+      };
+    }
+
+    const registroPlanoVoid = await buscarAssinaturaGooglePorToken(token);
+    if (registroPlanoVoid && obterTipoCompraRegistroGoogle(registroPlanoVoid) === 'avulso') {
+      const resultadoPlanoVoid = await sincronizarRegistroPlanoGoogle(
+        registroPlanoVoid,
+        { voided, origem: 'voided_purchase_notification' }
+      );
+      return {
+        processado: true,
+        tipo: 'plano_google_avulso',
+        status: resultadoPlanoVoid.status || 'sincronizado',
+        resultado: resultadoPlanoVoid,
       };
     }
 
@@ -4181,81 +4696,25 @@ async function processarRtdnGooglePlay(payload) {
     );
   }
 
-  const tipo = String(registro.tipo_compra || (subscription ? 'recorrente' : 'avulso')).toLowerCase();
-  const tipoNotificacaoAvulsa = Number(oneTime?.notificationType);
-  const tipoNotificacaoAssinatura = Number(subscription?.notificationType);
-
-  // ONE_TIME_PRODUCT_CANCELED = 2 (inclui cancelamento/revogação após reembolso).
-  // SUBSCRIPTION_CANCELED = 3; REVOKED = 12; EXPIRED = 13.
-  const cancelarAvulso = Boolean(oneTime && tipoNotificacaoAvulsa === 2);
-  const cancelarRecorrente = Boolean(subscription && [3, 12, 13].includes(tipoNotificacaoAssinatura));
-
-  if (!cancelarAvulso && !cancelarRecorrente) {
-    logGoogle('RTDN_EVENTO_INFORMATIVO', {
-      usuario_id: registro.usuario_id,
-      tipo_compra: tipo,
-      one_time_notification_type: oneTime?.notificationType ?? null,
-      subscription_notification_type: subscription?.notificationType ?? null,
+  // Para qualquer evento relacionado a plano, consulta o estado atualizado na
+  // API oficial e sincroniza o Supabase na hora. Isso também trata eventos de
+  // renovação/recuperação, não apenas cancelamentos.
+  if (oneTime || subscription || voided) {
+    const resultadoPlano = await sincronizarRegistroPlanoGoogle(registro, {
+      oneTime,
+      subscription,
+      voided,
+      origem: 'google_play_rtdn',
     });
-    return { processado: true, alterou_acesso: false, motivo: 'evento não revoga acesso' };
+    return {
+      processado: true,
+      tipo: 'plano_google',
+      status: resultadoPlano.status || 'sincronizado',
+      resultado: resultadoPlano,
+    };
   }
 
-  const agora = new Date().toISOString();
-  const statusFinal = cancelarAvulso ? 'estornado' : 'cancelado';
-  await atualizarAssinaturaGooglePorToken(token, {
-    status_assinatura: statusFinal,
-    tipo_compra: tipo,
-    recorrente: false,
-    auto_renovacao: false,
-    cancelado_em: agora,
-    updated_at: agora,
-  });
-
-  const usuarioId = registro.usuario_id;
-  const planoIdRegistro = registro.plano_id;
-  if (!usuarioId || !planoIdRegistro) {
-    logGoogle('RTDN_REGISTRO_INCOMPLETO', {
-      purchase_token: token,
-      tem_usuario_id: Boolean(usuarioId),
-      tem_plano_id: Boolean(planoIdRegistro),
-    });
-    return { processado: true, registro_atualizado: true, alterou_acesso: false, motivo: 'registro sem usuario_id/plano_id' };
-  }
-
-  const usuario = await buscarUsuarioGooglePorId(usuarioId);
-  if (!usuario) {
-    logGoogle('RTDN_USUARIO_NAO_ENCONTRADO', { usuario_id: usuarioId, plano_id: planoIdRegistro });
-    return { processado: true, registro_atualizado: true, alterou_acesso: false, motivo: 'usuário não encontrado' };
-  }
-
-  // Proteção: um evento atrasado de uma compra antiga não pode retirar um plano
-  // mais novo que o usuário já comprou.
-  const planoAtualId = String(usuario.plano_id || usuario.id_plano_atual || '');
-  if (planoAtualId !== String(planoIdRegistro)) {
-    logGoogle('RTDN_ACESSO_PRESERVADO_PLANO_DIFERENTE', {
-      usuario_id: usuarioId,
-      plano_do_evento: planoIdRegistro,
-      plano_atual: planoAtualId || null,
-      status_final: statusFinal,
-    });
-    return { processado: true, registro_atualizado: true, alterou_acesso: false, motivo: 'usuário já está em outro plano' };
-  }
-
-  const planoAtual = await buscarPlanoGooglePorId(planoIdRegistro);
-  if (!planoAtual) throw new Error(`Plano ${planoIdRegistro} não encontrado em tab_planos.`);
-  const downgrade = await retornarUsuarioAoPlanoGratisGoogle({ usuarioId, planoAtual });
-
-  logGoogle('RTDN_ACESSO_REVOGADO', {
-    usuario_id: usuarioId,
-    plano_cancelado_id: planoIdRegistro,
-    plano_gratis_id: downgrade.planoGratis.id,
-    tipo_compra: tipo,
-    status_final: statusFinal,
-    one_time_notification_type: oneTime?.notificationType ?? null,
-    subscription_notification_type: subscription?.notificationType ?? null,
-  });
-
-  return { processado: true, alterou_acesso: true, status: statusFinal, plano_gratis_id: downgrade.planoGratis.id };
+  return { processado: true, alterou_acesso: false, motivo: 'evento sem notificação de compra reconhecida' };
 }
 
 app.post('/google/pubsub/rtdn', async (req, res) => {
@@ -4446,20 +4905,37 @@ async function reconciliarEstornosSelosGoogle() {
   }
 }
 
-// Primeira execução após a inicialização e repetição a cada 30 minutos.
-// O intervalo pode ser ajustado no Render com GOOGLE_SELO_RECONCILIACAO_MS.
+// Uma rotina única executa sequencialmente selo e planos, evitando rajadas
+// simultâneas contra as APIs do Google e o Supabase. O valor já configurado
+// no Render para o selo também controla os planos.
 const GOOGLE_SELO_RECONCILIACAO_MS = Math.max(
   5 * 60 * 1000,
-  Number(process.env.GOOGLE_SELO_RECONCILIACAO_MS || 30 * 60 * 1000)
+  Number(process.env.GOOGLE_SELO_RECONCILIACAO_MS || 5 * 60 * 1000)
 );
+let reconciliacaoGoogleGeralEmAndamento = false;
+
+async function reconciliarTudoGoogle() {
+  if (reconciliacaoGoogleGeralEmAndamento) {
+    logGoogle('GOOGLE_RECONCILIACAO_GERAL_PULADA_EM_ANDAMENTO');
+    return;
+  }
+  reconciliacaoGoogleGeralEmAndamento = true;
+  try {
+    await reconciliarEstornosSelosGoogle();
+    await reconciliarPlanosGoogle();
+  } finally {
+    reconciliacaoGoogleGeralEmAndamento = false;
+  }
+}
+
 setTimeout(() => {
-  reconciliarEstornosSelosGoogle().catch((error) => {
-    logGoogle('SELO_RECONCILIACAO_EXECUCAO_ERRO', { erro: error.message });
+  reconciliarTudoGoogle().catch((error) => {
+    logGoogle('GOOGLE_RECONCILIACAO_GERAL_EXECUCAO_ERRO', { erro: error.message });
   });
 }, 20000);
 setInterval(() => {
-  reconciliarEstornosSelosGoogle().catch((error) => {
-    logGoogle('SELO_RECONCILIACAO_EXECUCAO_ERRO', { erro: error.message });
+  reconciliarTudoGoogle().catch((error) => {
+    logGoogle('GOOGLE_RECONCILIACAO_GERAL_EXECUCAO_ERRO', { erro: error.message });
   });
 }, GOOGLE_SELO_RECONCILIACAO_MS);
 
@@ -4508,7 +4984,7 @@ app.listen(
     );
 
     console.log(
-      `>>> Reconciliação automática do selo: ATIVA (${Math.round(GOOGLE_SELO_RECONCILIACAO_MS / 60000)} min)`
+      `>>> Reconciliação automática do selo e planos: ATIVA (${Math.round(GOOGLE_SELO_RECONCILIACAO_MS / 60000)} min)`
     );
 
     console.log(
