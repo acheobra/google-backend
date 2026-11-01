@@ -899,19 +899,26 @@ async function processarEstornoSeloGoogle(purchaseToken, registroSelo, eventoGoo
     return { processado: false, motivo: 'registro do selo incompleto' };
   }
   const agora = new Date().toISOString();
-  await atualizarPagamentoSeloGooglePorToken(purchaseToken, {
-    status_pagamento: 'estornado',
-  });
+
+  // Ordem intencional para permitir nova tentativa automática:
+  // primeiro revoga o selo; só depois marca o pagamento como estornado.
+  // Se o PATCH do pagamento falhar, o registro continua como 'pago' e o
+  // reconciliador poderá repetir a operação sem deixar o selo ativo.
   const selosAtualizados = await revogarSeloVerificacaoGoogle(
     registroSelo.usuario_id,
     'O pagamento do Selo de Verificação foi reembolsado ou anulado pela Google Play.'
   );
+  await atualizarPagamentoSeloGooglePorToken(purchaseToken, {
+    status_pagamento: 'estornado',
+  });
   logGoogle('SELO_GOOGLE_ESTORNO_PROCESSADO', {
     usuario_id: registroSelo.usuario_id,
     selo_id: registroSelo.selo_id || null,
     order_id: eventoGoogle?.orderId || registroSelo.google_order_id || null,
     selos_atualizados: selosAtualizados,
     voided_time_millis: eventoGoogle?.voidedTimeMillis || null,
+    order_state: eventoGoogle?.orderState || null,
+    fonte: eventoGoogle?.fonte || null,
   });
   return { processado: true, status: 'estornado', selos_atualizados: selosAtualizados, atualizado_em: agora };
 }
@@ -954,15 +961,19 @@ async function validarPagamentoSeloGoogle({ req, res, usuario, planoId, purchase
     return res.status(409).json({ success: false, validado: false, error: 'Este token já está vinculado a outra compra ou usuário.' });
   }
 
-  // Consulta auxiliar de compras anuladas. Uma falha nesta API NÃO pode
-  // impedir uma NOVA compra legítima do selo. A compra só será marcada como
-  // estornada quando o Google confirmar positivamente a anulação.
-  // A proteção local de status terminal continua obrigatória logo abaixo.
+  // Confirma reembolso por duas fontes oficiais:
+  // 1) orders.get, usando o google_order_id salvo no pagamento local;
+  // 2) Voided Purchases como alternativa quando orders.get não estiver disponível.
+  // Uma consulta inconclusiva NÃO bloqueia uma compra nova legítima, mas uma
+  // confirmação REFUNDED sempre impede que o token seja reativado.
   let compraAnulada = null;
   try {
-    compraAnulada = await consultarCompraAnuladaGoogle(purchaseToken);
+    compraAnulada = await consultarEstornoSeloGoogle(
+      purchaseToken,
+      registroSeloAnterior
+    );
   } catch (error) {
-    logGoogle('GOOGLE_VOIDED_PURCHASES_FALHA_VALIDACAO_CONTINUA', {
+    logGoogle('GOOGLE_CONSULTA_ESTORNO_FALHA_VALIDACAO_CONTINUA', {
       request_id: requestId,
       http_status: error.response?.status || null,
       erro: error.response?.data?.error?.message ||
@@ -983,7 +994,7 @@ async function validarPagamentoSeloGoogle({ req, res, usuario, planoId, purchase
         purchase_valid: false,
         pago: false,
         status: 'estornado',
-        status_google: 'VOIDED',
+        status_google: compraAnulada.orderState || 'VOIDED',
         selo_revogado: resultadoEstorno.selos_atualizados > 0,
         error: 'O Google confirmou que esta compra foi reembolsada/anulada. O selo foi revogado.',
       });
@@ -994,7 +1005,7 @@ async function validarPagamentoSeloGoogle({ req, res, usuario, planoId, purchase
       purchase_valid: false,
       pago: false,
       status: 'estornado',
-      status_google: 'VOIDED',
+      status_google: compraAnulada.orderState || 'VOIDED',
       error: 'O Google confirmou que esta compra foi reembolsada/anulada. Nenhum pagamento foi registrado.',
     });
   }
@@ -3496,6 +3507,140 @@ async function consultarCompraAnuladaGoogle(purchaseToken) {
   return null;
 }
 
+// ============================================================
+// GOOGLE PLAY ORDERS API - CONSULTA DO ESTADO REAL DO PEDIDO
+// ============================================================
+// GET /applications/{packageName}/orders/{orderId}
+// A resposta oficial contém state: PROCESSED, PENDING_REFUND,
+// PARTIALLY_REFUNDED ou REFUNDED. Só REFUNDED (reembolso integral)
+// revoga automaticamente o Selo de Verificação.
+async function consultarPedidoGooglePorOrderId(orderId) {
+  const pedido = String(orderId || '').trim();
+  if (!pedido) return null;
+
+  const packageName = obterGooglePackageName();
+  const accessToken = await obterAccessTokenGoogle();
+  const response = await axios({
+    method: 'GET',
+    url:
+      `${GOOGLE_ANDROID_PUBLISHER_BASE_URL}` +
+      `/applications/${encodeURIComponent(packageName)}` +
+      `/orders/${encodeURIComponent(pedido)}`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 30000,
+  });
+
+  return response.data || null;
+}
+
+// Retorna um objeto somente quando o Google confirma a anulação/reembolso.
+// Nunca confia apenas no status local nem em dados enviados pelo aplicativo.
+async function consultarEstornoSeloGoogle(purchaseToken, registroPagamento) {
+  const token = String(purchaseToken || '').trim();
+  if (!token) return null;
+
+  const orderIdLocal = String(registroPagamento?.google_order_id || '').trim();
+
+  if (orderIdLocal) {
+    try {
+      const pedido = await consultarPedidoGooglePorOrderId(orderIdLocal);
+      const orderIdGoogle = String(pedido?.orderId || '').trim();
+      const tokenGoogle = String(pedido?.purchaseToken || '').trim();
+      const produtosGoogle = Array.isArray(pedido?.lineItems)
+        ? pedido.lineItems.map((item) => String(item?.productId || '').trim())
+        : [];
+      const estadoPedido = String(pedido?.state || '').trim().toUpperCase();
+
+      // Confere se o pedido retornado é exatamente o que está vinculado ao
+      // pagamento local, ao token de compra e ao SKU do selo.
+      if (orderIdGoogle && orderIdGoogle !== orderIdLocal) {
+        throw new Error('A Google Play retornou orderId diferente do pagamento local.');
+      }
+      if (tokenGoogle && tokenGoogle !== token) {
+        throw new Error('A Google Play retornou purchaseToken diferente do pagamento local.');
+      }
+      if (!produtosGoogle.includes(GOOGLE_SELO_PRODUCT_ID)) {
+        logGoogle('SELO_ORDERS_GET_PRODUTO_DIVERGENTE', {
+          order_id: orderIdLocal,
+          purchase_token: token,
+          produtos_retornados: produtosGoogle,
+        });
+        return null;
+      }
+
+      logGoogle('SELO_ORDERS_GET_STATUS', {
+        order_id: orderIdLocal,
+        purchase_token: token,
+        order_state: estadoPedido || 'DESCONHECIDO',
+        confirmou_reembolso_integral: estadoPedido === 'REFUNDED',
+      });
+
+      if (estadoPedido === 'REFUNDED') {
+        logGoogle('SELO_ORDERS_GET_REEMBOLSO_CONFIRMADO', {
+          order_id: orderIdLocal,
+          purchase_token: token,
+          state: estadoPedido,
+          last_event_time: pedido?.lastEventTime || null,
+        });
+        return {
+          orderId: orderIdGoogle || orderIdLocal,
+          purchaseToken: token,
+          orderState: estadoPedido,
+          refundType: 'orders_get_refunded',
+          fonte: 'orders_get',
+          lastEventTime: pedido?.lastEventTime || null,
+        };
+      }
+
+      // PENDING_REFUND ainda não é reembolso concluído. PARTIALLY_REFUNDED
+      // também não encerra automaticamente o selo inteiro.
+      if (estadoPedido === 'PENDING_REFUND' || estadoPedido === 'PARTIALLY_REFUNDED') {
+        logGoogle('SELO_ORDERS_GET_REEMBOLSO_AINDA_NAO_INTEGRAL', {
+          order_id: orderIdLocal,
+          purchase_token: token,
+          order_state: estadoPedido,
+        });
+        return null;
+      }
+
+      // orders.get respondeu corretamente e informou que o pedido não está
+      // reembolsado. Não varremos a lista inteira de voided purchases em toda
+      // consulta normal do app; seguimos apenas com o estado oficial do pedido.
+      if (estadoPedido) return null;
+    } catch (error) {
+      logGoogle('SELO_ORDERS_GET_FALHA', {
+        order_id: orderIdLocal,
+        purchase_token: token,
+        http_status: error.response?.status || null,
+        erro: error.response?.data?.error?.message ||
+          error.response?.data?.message || error.message,
+        fallback: 'voided_purchases',
+      });
+    }
+  }
+
+  // Fallback: útil para registros antigos sem orderId ou indisponibilidade
+  // da Orders API. A função também valida o purchaseToken retornado pelo Google.
+  const anulada = await consultarCompraAnuladaGoogle(token);
+  if (anulada) {
+    const orderIdAnulado = String(anulada.orderId || '').trim();
+    if (orderIdLocal && orderIdAnulado && orderIdLocal !== orderIdAnulado) {
+      logGoogle('SELO_VOIDED_PURCHASES_ORDER_DIVERGENTE', {
+        order_id_local: orderIdLocal,
+        order_id_google: orderIdAnulado,
+        purchase_token: token,
+      });
+      return null;
+    }
+    return { ...anulada, fonte: 'voided_purchases' };
+  }
+
+  return null;
+}
+
 async function sincronizarReembolsoGoogleSeAnulado({ usuario, registroLocal }) {
   const purchaseToken = String(registroLocal?.purchase_token || '').trim();
   if (!purchaseToken) return null;
@@ -3611,7 +3756,7 @@ app.get(
         if (String(pagamentoSelo.usuario_id) !== String(usuario.id)) {
           return res.status(404).json({ success: false, error: 'Compra do selo não encontrada para este usuário.' });
         }
-        const anuladaSelo = await consultarCompraAnuladaGoogle(purchaseToken);
+        const anuladaSelo = await consultarEstornoSeloGoogle(purchaseToken, pagamentoSelo);
         if (anuladaSelo) {
           const resultadoEstorno = await processarEstornoSeloGoogle(purchaseToken, pagamentoSelo, anuladaSelo);
           return res.json({ success: true, local: { ...pagamentoSelo, status_pagamento: 'estornado' }, google: null, sincronizado: true, status: 'estornado', selo_revogado: true, resultado: resultadoEstorno, pedido_anulado: { orderId: anuladaSelo.orderId || null, productType: anuladaSelo.productType || null, refundType: anuladaSelo.refundType || null, voidedTimeMillis: anuladaSelo.voidedTimeMillis || null } });
@@ -3981,13 +4126,38 @@ async function processarRtdnGooglePlay(payload) {
     }
 
     if (pagamentoSelo) {
+      // Mesmo que o Pub/Sub entregue somente o evento de compra (type 1),
+      // consultamos o estado do pedido GPA. Isso permite reconhecer um
+      // reembolso feito depois da compra sem depender de um novo RTDN.
+      const estornoConfirmado = await consultarEstornoSeloGoogle(token, pagamentoSelo);
+      if (estornoConfirmado) {
+        logGoogle('RTDN_SELO_REEMBOLSO_CONFIRMADO_POR_CONSULTA', {
+          usuario_id: pagamentoSelo.usuario_id,
+          selo_id: pagamentoSelo.selo_id || null,
+          order_id: estornoConfirmado.orderId || pagamentoSelo.google_order_id || null,
+          fonte: estornoConfirmado.fonte || null,
+        });
+        const resultadoEstorno = await processarEstornoSeloGoogle(
+          token,
+          pagamentoSelo,
+          estornoConfirmado
+        );
+        return {
+          processado: true,
+          tipo: 'selo_verificacao',
+          status: 'estornado',
+          selo_revogado: Boolean(resultadoEstorno?.selos_atualizados > 0),
+          resultado: resultadoEstorno,
+        };
+      }
+
       logGoogle('RTDN_SELO_EVENTO_INFORMATIVO', {
         usuario_id: pagamentoSelo.usuario_id,
         selo_id: pagamentoSelo.selo_id || null,
         notification_type: oneTime?.notificationType ?? null,
         sku: produtoNotificado || null,
       });
-      return { processado: true, alterou_acesso: false, motivo: 'evento do selo não indica cancelamento/revogação' };
+      return { processado: true, alterou_acesso: false, motivo: 'pedido Google ainda não está integralmente reembolsado' };
     }
 
     logGoogle('RTDN_TOKEN_NAO_ENCONTRADO_RETRY', {
@@ -4131,7 +4301,7 @@ app.post('/google/diagnostico/selo-estorno', protegerDiagnostico, async (req, re
       return res.status(404).json({ success: false, confirmado_pelo_google: false, error: 'Nenhum pagamento de selo encontrado para esse purchase_token.' });
     }
 
-    const anulada = await consultarCompraAnuladaGoogle(purchaseToken);
+    const anulada = await consultarEstornoSeloGoogle(purchaseToken, pagamento);
     if (!anulada) {
       logGoogle('SELO_ESTORNO_DIAGNOSTICO_NAO_CONFIRMADO', {
         usuario_id: pagamento.usuario_id,
@@ -4143,7 +4313,7 @@ app.post('/google/diagnostico/selo-estorno', protegerDiagnostico, async (req, re
         confirmado_pelo_google: false,
         atualizado: false,
         status_pagamento_atual: pagamento.status_pagamento,
-        message: 'A API Voided Purchases não retornou anulação para esse token. Nenhum dado foi alterado.',
+        message: 'As consultas oficiais do pedido e de compras anuladas não confirmaram reembolso integral. Nenhum dado foi alterado.',
       });
     }
 
@@ -4161,6 +4331,8 @@ app.post('/google/diagnostico/selo-estorno', protegerDiagnostico, async (req, re
         productType: anulada.productType || null,
         refundType: anulada.refundType || null,
         voidedTimeMillis: anulada.voidedTimeMillis || null,
+        orderState: anulada.orderState || null,
+        fonte: anulada.fonte || null,
       },
     });
   } catch (error) {
@@ -4176,6 +4348,120 @@ app.post('/google/diagnostico/selo-estorno', protegerDiagnostico, async (req, re
     });
   }
 });
+
+// ============================================================
+// RECONCILIAÇÃO AUTOMÁTICA DE REEMBOLSOS DO SELO
+// ============================================================
+// O servidor verifica periodicamente pagamentos de selo ainda marcados como
+// 'pago'. Isso cobre reembolsos feitos no Play Console mesmo quando o RTDN
+// não entrega um evento voidedPurchaseNotification.
+// Não consulta nem altera tab_assinaturas_google ou planos recorrentes.
+let reconciliacaoSeloEmAndamento = false;
+
+async function reconciliarEstornosSelosGoogle() {
+  if (reconciliacaoSeloEmAndamento) {
+    logGoogle('SELO_RECONCILIACAO_PULADA_EM_ANDAMENTO');
+    return;
+  }
+
+  reconciliacaoSeloEmAndamento = true;
+  let verificados = 0;
+  let estornados = 0;
+  let falhas = 0;
+
+  try {
+    const { supabaseUrl } = obterConfiguracaoSupabase();
+    const response = await axios({
+      method: 'GET',
+      url: `${supabaseUrl}/rest/v1/tab_pagamentos_selo_google`,
+      params: {
+        select: 'usuario_id,selo_id,purchase_token,google_order_id,status_pagamento',
+        // Inclui 'estornado' para reparar eventual execução antiga que tenha
+        // marcado o pagamento antes de conseguir revogar o registro do selo.
+        status_pagamento: 'in.(pago,estornado)',
+        order: 'updated_at.asc',
+        limit: 1000,
+      },
+      headers: obterHeadersSupabase(),
+      timeout: 30000,
+    });
+
+    const pagamentos = Array.isArray(response.data) ? response.data : [];
+    logGoogle('SELO_RECONCILIACAO_INICIO', {
+      pagamentos_pagos_ou_estornados_encontrados: pagamentos.length,
+      limite_consulta: 1000,
+    });
+
+    for (const pagamento of pagamentos) {
+      const purchaseToken = String(pagamento?.purchase_token || '').trim();
+      if (!purchaseToken) continue;
+      verificados += 1;
+
+      try {
+        const confirmacao = await consultarEstornoSeloGoogle(purchaseToken, pagamento);
+        if (!confirmacao) continue;
+
+        const resultado = await processarEstornoSeloGoogle(
+          purchaseToken,
+          pagamento,
+          confirmacao
+        );
+        if (resultado?.processado) estornados += 1;
+
+        logGoogle('SELO_RECONCILIACAO_REEMBOLSO_APLICADO', {
+          usuario_id: pagamento.usuario_id || null,
+          selo_id: pagamento.selo_id || null,
+          order_id: confirmacao.orderId || pagamento.google_order_id || null,
+          fonte: confirmacao.fonte || null,
+          selos_atualizados: resultado?.selos_atualizados || 0,
+        });
+      } catch (error) {
+        falhas += 1;
+        logGoogle('SELO_RECONCILIACAO_PAGAMENTO_ERRO', {
+          usuario_id: pagamento.usuario_id || null,
+          selo_id: pagamento.selo_id || null,
+          purchase_token: purchaseToken,
+          http_status: error.response?.status || null,
+          erro: error.response?.data?.error?.message ||
+            error.response?.data?.message || error.message,
+        });
+      }
+    }
+
+    logGoogle('SELO_RECONCILIACAO_CONCLUIDA', {
+      pagamentos_verificados: verificados,
+      estornos_aplicados: estornados,
+      falhas: falhas,
+      limite_consulta: 1000,
+      atingiu_limite: pagamentos.length === 1000,
+    });
+  } catch (error) {
+    logGoogle('SELO_RECONCILIACAO_ERRO_GERAL', {
+      http_status: error.response?.status || null,
+      erro: error.response?.data?.error?.message ||
+        error.response?.data?.message || error.message,
+    });
+  } finally {
+    reconciliacaoSeloEmAndamento = false;
+  }
+}
+
+// Primeira execução após a inicialização e repetição a cada 30 minutos.
+// O intervalo pode ser ajustado no Render com GOOGLE_SELO_RECONCILIACAO_MS.
+const GOOGLE_SELO_RECONCILIACAO_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.GOOGLE_SELO_RECONCILIACAO_MS || 30 * 60 * 1000)
+);
+setTimeout(() => {
+  reconciliarEstornosSelosGoogle().catch((error) => {
+    logGoogle('SELO_RECONCILIACAO_EXECUCAO_ERRO', { erro: error.message });
+  });
+}, 20000);
+setInterval(() => {
+  reconciliarEstornosSelosGoogle().catch((error) => {
+    logGoogle('SELO_RECONCILIACAO_EXECUCAO_ERRO', { erro: error.message });
+  });
+}, GOOGLE_SELO_RECONCILIACAO_MS);
 
 // ============================================================
 // INICIAR SERVIDOR
@@ -4219,6 +4505,10 @@ app.listen(
           ? 'SIM'
           : 'NÃO'
       }`
+    );
+
+    console.log(
+      `>>> Reconciliação automática do selo: ATIVA (${Math.round(GOOGLE_SELO_RECONCILIACAO_MS / 60000)} min)`
     );
 
     console.log(
